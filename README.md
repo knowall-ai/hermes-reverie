@@ -23,6 +23,14 @@ hermes memory setup reverie
   the agent reviews its conversations, remembers what matters, merges duplicates, fixes labels,
   looks for connections, and writes a dream diary to `~/.hermes/dreams/`.
 
+## Two flavours, one graph
+
+- **Hermes memory provider** (this repo): automatic recall before every turn, the `reverie` tool,
+  and Dreaming. For agents running on Hermes.
+- **Reverie MCP server** ([knowall-ai/mcp-neo4j-agent-memory](https://github.com/KnowAll-AI/mcp-neo4j-agent-memory),
+  npm `@knowall-ai/reverie`): the same graph over the Model Context Protocol for any other agent
+  (OpenClaw, Claude Desktop, Foundry). Both use the conventions below, so one graph can serve both.
+
 ## Graph conventions
 
 Labels are capitalised singular: `Person`, `Organization`, `Project`, `Product`, `Concept`,
