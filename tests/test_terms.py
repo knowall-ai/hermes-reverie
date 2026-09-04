@@ -53,8 +53,12 @@ def test_terms_pick_names_emails_and_quotes():
 
 
 def test_terms_dedupe_and_cap():
-    text = " ".join(f"Person{i} Surname{i}" for i in range(20))
-    assert len(reverie.recall_terms(text)) == 8
+    names = ["Alice Smith", "Bob Jones", "Carol White", "Dan Brown", "Eve Black", "Frank Green",
+             "Grace Hall", "Heidi King", "Ivan Lee", "Judy Moore"]
+    text = ", ".join(names) + ", " + ", ".join(names)  # repeats must dedupe, then cap at 8
+    terms = reverie.recall_terms(text)
+    assert len(terms) == 8
+    assert len(set(t.lower() for t in terms)) == 8
     assert reverie.recall_terms("") == []
 
 
