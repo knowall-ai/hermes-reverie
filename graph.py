@@ -49,7 +49,10 @@ class Graph:
                  timeout: float = 3.0):
         from neo4j import GraphDatabase  # lazy: is_available() must not import it
 
-        self._driver = GraphDatabase.driver(uri, auth=(user, password), connection_timeout=timeout)
+        # notifications off: optional properties such as ``aliases`` raise UnknownPropertyKey
+        # warnings on every recall until the first node carrying them exists.
+        self._driver = GraphDatabase.driver(uri, auth=(user, password), connection_timeout=timeout,
+                                            notifications_min_severity="OFF")
         self._database = database or None
         self._timeout = timeout
 
