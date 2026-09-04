@@ -1,0 +1,13 @@
+name: reverie
+version: 0.1.0
+description: "Reverie — KnowAll graph memory that dreams. Neo4j knowledge graph (people, organisations, projects, concepts, meetings) recalled before every turn, plus nightly Dreaming consolidation."
+author: KnowAll AI
+kind: memory
+pip_dependencies:
+  - neo4j>=5.20,<6
+requires_env:
+  - NEO4J_PASSWORD
+optional_env:
+  - NEO4J_URI
+  - NEO4J_USERNAME
+  - NEO4J_DATABASE
