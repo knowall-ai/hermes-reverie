@@ -7,6 +7,11 @@ graph, returning results in the same shapes: memories carry ``_id``/``_labels`` 
 ``_score``/``_match`` from a search), relationships carry ``_type``, deletes return
 ``deletedCount``. Embedding fields are never returned, exactly as the real server scrubs them.
 
+Search follows the server's contract (mcp-reverie @ 95baf2a): ``search_mode: "exact"`` is
+case-insensitive equality on ``name``, an alias or ``email``, every other mode matches keywords,
+and archived memories (``status = 'archived'``) are left out of the results and out of the
+connections returned with them unless ``include_archived: true`` is passed.
+
 Behaviour is steered by the environment so tests can provoke failures:
 
 ``FAKE_MCP_STATE``       JSON file the graph is persisted to, so a restarted server keeps it.
@@ -31,7 +36,7 @@ IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 # allowed top-level keys per tool, and nothing else.
 ALLOWED_KEYS = {
     "search_memories": ("query", "label", "depth", "order_by", "limit", "since_date",
-                        "search_mode", "similarity_threshold"),
+                        "search_mode", "similarity_threshold", "include_archived"),
     "create_memory": ("label", "properties"),
     "update_memory": ("nodeId", "properties"),
     "create_connection": ("fromMemoryId", "toMemoryId", "type", "properties"),
@@ -118,8 +123,10 @@ def check_args(tool, args):
             raise ValueError("Invalid search_memories arguments: depth")
         if "limit" in args and not (isinstance(args["limit"], int) and 1 <= args["limit"] <= 200):
             raise ValueError("Invalid search_memories arguments: limit")
-        if "search_mode" in args and args["search_mode"] not in ("hybrid", "keyword", "semantic"):
+        if "search_mode" in args and args["search_mode"] not in ("hybrid", "keyword", "semantic", "exact"):
             raise ValueError("Invalid search_memories arguments: search_mode")
+        if "include_archived" in args and not isinstance(args["include_archived"], bool):
+            raise ValueError("Invalid search_memories arguments: include_archived")
         if "similarity_threshold" in args:
             threshold = args["similarity_threshold"]
             if not isinstance(threshold, (int, float)) or isinstance(threshold, bool) or not 0 <= threshold <= 1:
@@ -147,6 +154,20 @@ def content_values(props):
     return [v for k, v in props.items() if not k.startswith("_") and k not in HOUSEKEEPING and v is not None]
 
 
+def is_archived(props):
+    return str(props.get("status", "")).lower() == "archived"
+
+
+def exact_match(query, props):
+    """Case-insensitive equality on name, an alias or the email — the server's ``exact`` mode."""
+    wanted = query.strip().lower()
+    if not wanted:
+        return False
+    aliases = props.get("aliases")
+    values = [props.get("name"), props.get("email")] + (list(aliases) if isinstance(aliases, list) else [])
+    return any(isinstance(v, str) and v.strip().lower() == wanted for v in values)
+
+
 def keyword_match(query, props):
     words = [w for w in query.strip().lower().split() if w]
     if not words:
@@ -171,18 +192,27 @@ class FakeServer:
         depth = args.get("depth", 1)
         limit = min(int(args.get("limit", 10)), 200)
         mode = args.get("search_mode", "hybrid")
+        include_archived = bool(args.get("include_archived"))
+        matches = exact_match if mode == "exact" else keyword_match
+        match_kind = {"exact": "exact", "semantic": "semantic"}.get(mode, "keyword")
         rows = []
         for node_id, node in sorted(self.graph.nodes.items()):
             if label and node["label"].lower() != str(label).lower():
                 continue
-            if not keyword_match(query, node["props"]):
+            # Archived memories are hidden unless the caller asks for them, exactly as the server
+            # does: out of the results, and out of the neighbourhoods of the results.
+            if not include_archived and is_archived(node["props"]):
                 continue
-            memory = self.graph.memory(node_id, {"_score": 1.0, "_match": "keyword" if mode != "semantic" else "semantic"})
+            if not matches(query, node["props"]):
+                continue
+            memory = self.graph.memory(node_id, {"_score": 1.0, "_match": match_kind})
             connections = []
             if depth:
                 for rel in self.graph.rels:
                     other = rel["to"] if rel["from"] == node_id else (rel["from"] if rel["to"] == node_id else None)
                     if other is None or other not in self.graph.nodes:
+                        continue
+                    if not include_archived and is_archived(self.graph.nodes[other]["props"]):
                         continue
                     connections.append({
                         "memory": self.graph.memory(other),
@@ -241,7 +271,7 @@ class FakeServer:
     def memory_stats(self, _args):
         labels = {}
         for node in self.graph.nodes.values():
-            if str(node["props"].get("status", "")).lower() == "archived":
+            if is_archived(node["props"]):
                 continue
             labels[node["label"]] = labels.get(node["label"], 0) + 1
         return {"nodes": sum(labels.values()), "relationships": len(self.graph.rels), "labels": labels,

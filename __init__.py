@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
 
-from .graph import CANONICAL_LABELS, DEFAULT_SERVER_COMMAND, Graph
+from .graph import CANONICAL_LABELS, DEFAULT_SERVER_COMMAND, SEARCH_MODES, Graph
 
 logger = logging.getLogger(__name__)
 
@@ -114,9 +114,11 @@ REVERIE_TOOL = {
         "meetings and decisions. Recall happens automatically before each turn; use this tool to "
         "look deeper or to write.\n\nACTIONS:\n"
         "• search — hybrid keyword + semantic search, so 'Ben Weeks' also finds 'Benjamin Weeks'. "
-        "Optional search_mode (hybrid | keyword | semantic) and similarity_threshold (0-1, default 0.4) "
-        "tune it: keyword for exact lookups, semantic for 'who else is like this', a higher threshold "
-        "for fewer, closer matches.\n"
+        "Optional search_mode (hybrid | keyword | semantic | exact) and similarity_threshold (0-1, "
+        "default 0.4) tune it: exact to ask whether one name is already in the graph (it matches only a "
+        "memory whose name, alias or email equals the query), keyword for a literal word, semantic for "
+        "'who else is like this', a higher threshold for fewer, closer matches. Archived memories are "
+        "never returned.\n"
         "• probe — everything about one entity and its relationships.\n"
         "• remember — create or update an entity: label + name + properties (role, email, company, notes). "
         "An existing entity with the same name is updated, never duplicated.\n"
@@ -148,8 +150,9 @@ REVERIE_TOOL = {
             "to_label": {"type": "string", "description": "connect/forget: label of the target, when the name alone is ambiguous"},
             "type": {"type": "string", "description": "connect/forget: relationship type in UPPER_SNAKE"},
             "limit": {"type": "integer", "description": "max results (default 10)", "minimum": 1},
-            "search_mode": {"type": "string", "enum": ["hybrid", "keyword", "semantic"],
-                            "description": "search: hybrid (default), keyword-only or semantic-only"},
+            "search_mode": {"type": "string", "enum": list(SEARCH_MODES),
+                            "description": "search: hybrid (default), keyword-only, semantic-only, or "
+                                           "exact (case-insensitive equality on name, alias or email)"},
             "similarity_threshold": {"type": "number", "minimum": 0, "maximum": 1,
                                      "description": "search: semantic cut-off, 0-1 (server default 0.4)"},
             "depth": {"type": "integer", "minimum": 0, "maximum": 5,

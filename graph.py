@@ -46,18 +46,24 @@ READ_ONLY_PROCEDURES = frozenset({
 })
 
 DEFAULT_SERVER_COMMAND = "reverie"
-SEARCH_MODES = ("hybrid", "keyword", "semantic")
+#: Search modes the server accepts (mcp-reverie ``src/search.ts`` @ 95baf2a). ``exact`` is
+#: case-insensitive equality on ``name``, ``aliases`` or ``email`` — a lookup, not a ranking.
+SEARCH_MODES = ("hybrid", "keyword", "semantic", "exact")
+#: The modes that make sense as the *recall* default: exact belongs to name lookups, not to
+#: reading a prompt, so it is not offered as a configured default.
+RECALL_MODES = ("hybrid", "keyword", "semantic")
 SEARCH_MAX_LIMIT = 200
 SEARCH_MAX_DEPTH = 5
 #: Embedding providers the server accepts in REVERIE_EMBEDDINGS.
 EMBEDDING_PROVIDERS = ("local", "openai", "azure", "ollama", "voyage", "none")
 #: Values Neo4j can store on a node or relationship.
 PRIMITIVES = (str, int, float, bool)
-#: How an exact-name lookup asks the server. The server has no exact mode yet, so a keyword
-#: search returns every node containing the name and the exact match is picked out client-side;
-#: the limit is the server's maximum so a common first name cannot push the real node out of the
-#: page. When mcp-reverie ships ``search_mode: "exact"``, this dict is the only thing to change.
-NAME_SEARCH = {"search_mode": "keyword", "limit": SEARCH_MAX_LIMIT, "depth": 0}
+#: How an exact-name lookup asks the server: ``search_mode: "exact"`` returns only memories whose
+#: name, alias or email equals the query, case-insensitively, and archived memories are left out
+#: server-side. The limit stays the server's maximum so every duplicate of a name is on the page —
+#: :meth:`Graph.resolve` has to see all of them to refuse an ambiguous write. This dict is the one
+#: switch point for how names are looked up.
+NAME_SEARCH = {"search_mode": "exact", "limit": SEARCH_MAX_LIMIT, "depth": 0}
 #: Neighbours rendered per recalled entity, as before.
 MAX_RELS = 8
 
@@ -181,10 +187,6 @@ def _node_label(memory: Dict[str, Any]) -> str:
     return labels[0] if labels else "Memory"
 
 
-def _is_archived(props: Dict[str, Any]) -> bool:
-    return str(props.get("status", "")).lower() == "archived"
-
-
 class Graph:
     """Reverie's graph verbs, each one or two MCP tool calls.
 
@@ -193,6 +195,11 @@ class Graph:
         search_mode: default mode for recall (``hybrid``, ``keyword`` or ``semantic``).
         similarity_threshold: semantic cut-off passed to the server (it defaults to 0.4).
         depth: relationship depth included with each recalled entity (0-5).
+
+    Archived memories (``status = 'archived'``) are excluded by the server, from results and from
+    the neighbourhoods it returns with them; nothing here filters them again. No verb needs them
+    back, so nothing passes ``include_archived: true`` — :meth:`search_memories` takes the flag for
+    a caller that one day does.
     """
 
     def __init__(
@@ -203,8 +210,8 @@ class Graph:
         depth: int = 1,
     ) -> None:
         self.client = client
-        if search_mode not in SEARCH_MODES:
-            raise ValueError(f"invalid search_mode: {search_mode!r} — one of {', '.join(SEARCH_MODES)}")
+        if search_mode not in RECALL_MODES:
+            raise ValueError(f"invalid search_mode: {search_mode!r} — one of {', '.join(RECALL_MODES)}")
         self.search_mode = search_mode
         self.similarity_threshold = similarity_threshold
         self.depth = max(0, min(5, int(depth)))
@@ -235,8 +242,8 @@ class Graph:
         )
         # Validate here, once, rather than failing the same way on every recall.
         mode = str(config.get("search_mode") or "hybrid")
-        if mode not in SEARCH_MODES:
-            raise ValueError(f"invalid search_mode: {mode!r} — one of {', '.join(SEARCH_MODES)}")
+        if mode not in RECALL_MODES:
+            raise ValueError(f"invalid search_mode: {mode!r} — one of {', '.join(RECALL_MODES)}")
         return cls(
             client,
             search_mode=mode,
@@ -270,17 +277,24 @@ class Graph:
         similarity_threshold: Optional[float] = None,
         since_date: Optional[str] = None,
         order_by: Optional[str] = None,
+        include_archived: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """Raw ``search_memories`` rows: ``{memory: {...}, connections: [...]}``.
 
         Arguments are validated here, to the same rules the server enforces, so a bad call fails
         with a message Hermes can act on instead of a rejected tool call.
+
+        ``include_archived`` is the only way to see soft-deleted memories: without it the server
+        leaves ``status = 'archived'`` nodes out of the results *and* out of the connections it
+        returns with the ones it keeps.
         """
         mode = search_mode or self.search_mode
         if mode not in SEARCH_MODES:
             raise ValueError(f"invalid search_mode: {mode!r} — one of {', '.join(SEARCH_MODES)}")
         if label is not None and not isinstance(label, str):
             raise ValueError(f"invalid label: {label!r} — must be text")
+        if include_archived is not None and not isinstance(include_archived, bool):
+            raise ValueError(f"invalid include_archived: {include_archived!r} — must be true or false")
         rows = self.call(
             "search_memories",
             query=str(query or ""),
@@ -293,6 +307,7 @@ class Graph:
             ),
             since_date=since_date,
             order_by=order_by,
+            include_archived=include_archived,
         )
         return rows if isinstance(rows, list) else []
 
@@ -310,16 +325,16 @@ class Graph:
         The terms are joined into one query: the server's keyword pass matches a node when any
         word of the query appears in any of its content properties, which is the OR the old
         Cypher did, in a single round trip. In hybrid mode the semantic pass then adds close
-        variants ("Ben Weeks" finding "Benjamin Weeks") that keywords miss. Archived nodes are
-        dropped, as they always were.
+        variants ("Ben Weeks" finding "Benjamin Weeks") that keywords miss. Archived nodes never
+        come back — the server excludes them, from the hits and from their neighbourhoods — so the
+        page asked for is the page used.
         """
         terms = [str(t).strip() for t in terms if t and str(t).strip()]
         if not terms:
             return []
-        # Ask for more than we need: archived nodes are filtered client-side.
         rows = self.search_memories(
             " ".join(terms),
-            limit=_int_in_range(int(limit) * 2, 1, SEARCH_MAX_LIMIT, "limit"),
+            limit=_int_in_range(limit, 1, SEARCH_MAX_LIMIT, "limit"),
             label=label,
             depth=depth,
             search_mode=search_mode,
@@ -328,7 +343,7 @@ class Graph:
         hits: List[Dict[str, Any]] = []
         seen: set = set()
         for hit in (self._to_hit(row) for row in rows):
-            if hit is None or _is_archived(hit["props"]) or hit["id"] in seen:
+            if hit is None or hit["id"] in seen:
                 continue
             seen.add(hit["id"])
             hits.append(hit)
@@ -377,32 +392,24 @@ class Graph:
         return self.recall([name.strip()], limit=3)
 
     def find_all(self, name: str, label: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Every live node whose ``name`` equals ``name``, case-insensitively.
+        """Every live node whose ``name`` — or alias, or email — equals ``name``, case-insensitively.
 
         This is the dedupe step in front of every write: the graph must never grow a second
-        "Atlantic Pharma" because the agent typed it differently. The label, when given, is
-        pushed down to the server so a common first name cannot crowd the real node out of the
-        page — and it narrows what "the node called X" means when several labels share a name.
+        "Atlantic Pharma" because the agent typed it differently. The whole match runs on the
+        server (``search_mode: "exact"``), so "James Kelly" cannot be crowded out of the page by
+        the hundred nodes a keyword search for "James" would return, and an alias or email the
+        agent typed instead of the name still finds the node it belongs to. The label, when given,
+        is pushed down too: it narrows what "the node called X" means when several labels share a
+        name. Archived nodes are excluded server-side.
         """
-        wanted = (name or "").strip().lower()
+        wanted = (name or "").strip()
         if not wanted:
             return []
-        rows = self.search_memories(name.strip(), label=label, **NAME_SEARCH)
-        wanted_label = (label or "").strip().lower()
-        matches: List[Dict[str, Any]] = []
-        for row in rows:
-            hit = self._to_hit(row)
-            if hit is None or _is_archived(hit["props"]):
-                continue
-            if str(hit["props"].get("name", "")).strip().lower() != wanted:
-                continue
-            if wanted_label and hit["label"].lower() != wanted_label:
-                continue
-            matches.append(hit)
-        return matches
+        rows = self.search_memories(wanted, label=label, **NAME_SEARCH)
+        return [hit for hit in (self._to_hit(row) for row in rows) if hit is not None]
 
     def find(self, name: str, label: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """The node whose ``name`` equals ``name`` case-insensitively, or None.
+        """The one node whose name, alias or email equals ``name`` case-insensitively, or None.
 
         Several matches mean the graph holds duplicates (Dreaming merges them); the first is
         used, as it always was. Use :meth:`find_all` where ambiguity must be refused instead.
@@ -487,7 +494,8 @@ class Graph:
         """Archive an entity — or delete it outright with ``hard=True``.
 
         Archiving stays the default so ``forget`` keeps the behaviour SOUL and the skills expect:
-        the node stops being recalled (recall drops ``status = 'archived'``) but its history and
+        the node stops being recalled — the server leaves ``status = 'archived'`` out of every
+        search and out of the neighbourhoods of the nodes it does return — but its history and
         relationships survive. ``hard`` maps to the server's ``delete_memory``, which detaches
         and deletes.
         """
@@ -563,6 +571,6 @@ class Graph:
 
 __all__ = [
     "AmbiguousMemory", "CANONICAL_LABELS", "DEFAULT_SERVER_COMMAND", "EMBEDDING_PROVIDERS",
-    "Graph", "MCPClient", "MCPError", "MCPToolError", "MemoryNotFound", "canonical_label",
-    "read_only_violation",
+    "Graph", "MCPClient", "MCPError", "MCPToolError", "MemoryNotFound", "NAME_SEARCH",
+    "RECALL_MODES", "SEARCH_MODES", "canonical_label", "read_only_violation",
 ]
