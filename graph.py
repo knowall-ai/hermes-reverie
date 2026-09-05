@@ -1,34 +1,157 @@
-"""Neo4j access for Reverie.
+"""Reverie's graph, over the mcp-reverie MCP server.
 
-One small class over the official driver. Every query is parameterised; labels and
-relationship types are validated against a strict identifier pattern before they are
-interpolated, because Cypher cannot parameterise them.
+There is no Neo4j driver here any more. Every read and write goes through the
+`mcp-reverie <https://github.com/knowall-ai/mcp-reverie>`_ server (binary ``reverie``, alias
+``mcp-neo4j-agent-memory``) over stdio MCP, so the Hermes plugin and the MCP server share one
+graph, one set of conventions, one hybrid keyword+semantic search and one Dreaming
+implementation. This module is a thin adapter: it maps Reverie's verbs onto the server's tools
+and normalises the answers back into the shapes the provider has always rendered.
+
+  recall/search → ``search_memories``      remember → ``search_memories`` + ``create_memory``/``update_memory``
+  connect       → ``create_connection``    forget   → ``update_memory`` (archive) or ``delete_memory``
+  probe/cypher  → ``search_memories``/``query_memories``
+  stats         → ``memory_stats``         dream    → ``dream``
 
 Graph conventions (shared with the MCP server so several agents can read one another's data):
 labels are capitalised singular (Person, Organization, Project, Product, Concept, Meeting,
-Decision); every node has ``name``; matching is case-insensitive on ``name`` and ``aliases``;
-relationships are UPPER_SNAKE (WORKS_AT, HAS_ROLE, PARTNERS_WITH, INTRODUCED_BY,
-INTERESTED_IN, MET_WITH, DISCUSSED, DECIDED, OWNS, BLOCKED_BY).
+Decision, Risk); every node has ``name``; matching is case-insensitive; relationships are
+UPPER_SNAKE (WORKS_AT, HAS_ROLE, PARTNERS_WITH, INTRODUCED_BY, INTERESTED_IN, MET_WITH,
+DISCUSSED, DECIDED, OWNS, BLOCKED_BY).
 """
 from __future__ import annotations
 
 import logging
-import os
 import re
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
+from .mcp_client import MCPClient, MCPError, MCPToolError, server_env_from_environ
+
 logger = logging.getLogger(__name__)
 
-IDENT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+#: Mirrors the server's IDENTIFIER_RE (mcp-reverie src/types.ts, contract 01dceae): labels and
+#: relationship types are interpolated into Cypher, so they must be plain identifiers.
+IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 CANONICAL_LABELS = ("Person", "Organization", "Project", "Product", "Concept", "Meeting", "Decision", "Risk")
-WRITE_RE = re.compile(r"\b(CREATE|MERGE|SET|DELETE|REMOVE|DROP|DETACH|LOAD\s+CSV|CALL\s+\{)\b", re.IGNORECASE)
+#: Mirrors the server's read-only guard (src/cypher-guard.ts).
+WRITE_RE = re.compile(r"\b(CREATE|MERGE|SET|DELETE|REMOVE|DROP|DETACH|FOREACH|LOAD\s+CSV)\b", re.IGNORECASE)
+CALL_RE = re.compile(r"\bCALL\b", re.IGNORECASE)
+PROCEDURE_RE = re.compile(r"^\s*([A-Za-z_][\w.]*)")
+COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+READ_ONLY_PROCEDURES = frozenset({
+    "db.labels", "db.relationshiptypes", "db.propertykeys",
+    "db.schema.visualization", "db.schema.nodetypeproperties", "db.schema.reltypeproperties",
+    "db.index.vector.querynodes", "db.index.vector.queryrelationships",
+    "db.index.fulltext.querynodes", "db.index.fulltext.queryrelationships",
+})
+
+DEFAULT_SERVER_COMMAND = "reverie"
+SEARCH_MODES = ("hybrid", "keyword", "semantic")
+SEARCH_MAX_LIMIT = 200
+SEARCH_MAX_DEPTH = 5
+#: Embedding providers the server accepts in REVERIE_EMBEDDINGS.
+EMBEDDING_PROVIDERS = ("local", "openai", "azure", "ollama", "voyage", "none")
+#: Values Neo4j can store on a node or relationship.
+PRIMITIVES = (str, int, float, bool)
+#: How an exact-name lookup asks the server. The server has no exact mode yet, so a keyword
+#: search returns every node containing the name and the exact match is picked out client-side;
+#: the limit is the server's maximum so a common first name cannot push the real node out of the
+#: page. When mcp-reverie ships ``search_mode: "exact"``, this dict is the only thing to change.
+NAME_SEARCH = {"search_mode": "keyword", "limit": SEARCH_MAX_LIMIT, "depth": 0}
+#: Neighbours rendered per recalled entity, as before.
+MAX_RELS = 8
+
+
+class MemoryNotFound(RuntimeError):
+    """No memory carries this name (with this label, when one was given)."""
+
+    def __init__(self, message: str, name: str, label: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.name = name
+        self.label = label
+
+
+class AmbiguousMemory(RuntimeError):
+    """Several memories carry this name, so the caller must say which one it meant."""
+
+    def __init__(self, message: str, name: str, matches: List[Dict[str, Any]]) -> None:
+        super().__init__(message)
+        self.name = name
+        self.matches = matches
 
 
 def _ident(value: str, what: str) -> str:
     if not isinstance(value, str) or not IDENT_RE.match(value):
-        raise ValueError(f"invalid {what}: {value!r}")
+        raise ValueError(
+            f"invalid {what}: {value!r} — must match [A-Za-z_][A-Za-z0-9_]{{0,63}} "
+            "(labels and relationship types are identifiers, not free text)"
+        )
     return value
+
+
+def _node_id(value: Any, what: str = "node id") -> int:
+    """The server takes non-negative integer node ids and rejects anything else."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"invalid {what}: {value!r} — must be a non-negative integer")
+    return value
+
+
+def _properties(props: Any, what: str) -> Dict[str, Any]:
+    """A plain mapping of Neo4j-storable values: no arrays at the top level, no nested objects."""
+    if props is None:
+        return {}
+    if not isinstance(props, dict):
+        raise ValueError(f"{what} must be an object, not {type(props).__name__}")
+    for key, value in props.items():
+        if not isinstance(key, str):
+            raise ValueError(f"{what} keys must be strings, got {key!r}")
+        if value is None or isinstance(value, PRIMITIVES):
+            continue
+        if isinstance(value, (list, tuple)) and all(v is None or isinstance(v, PRIMITIVES) for v in value):
+            continue
+        raise ValueError(
+            f"{what}['{key}'] is a {type(value).__name__}; a graph property must be text, a number, "
+            "a boolean or a list of those — model anything richer as its own memory and connect it"
+        )
+    return dict(props)
+
+
+def _int_in_range(value: Any, low: int, high: int, what: str) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid {what}: {value!r} — must be an integer") from None
+    return max(low, min(high, number))
+
+
+def _threshold(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid similarity_threshold: {value!r} — must be a number in 0..1") from None
+    if number != number or number in (float("inf"), float("-inf")) or not 0.0 <= number <= 1.0:
+        raise ValueError(f"invalid similarity_threshold: {value!r} — must be a finite number in 0..1")
+    return number
+
+
+def read_only_violation(cypher: str) -> Optional[str]:
+    """Why this Cypher is not read-only, or None. Mirrors the server's guard, comments and all."""
+    stripped = COMMENT_RE.sub(" ", cypher or "")
+    write = WRITE_RE.search(stripped)
+    if write:
+        return f"{write.group(1).upper()} is not allowed"
+    for match in CALL_RE.finditer(stripped):
+        rest = stripped[match.end():]
+        if rest.lstrip().startswith("{"):
+            return "CALL subqueries are not allowed"
+        procedure = PROCEDURE_RE.match(rest)
+        if not procedure:
+            return "CALL could not be resolved to a procedure"
+        if procedure.group(1).lower() not in READ_ONLY_PROCEDURES:
+            return f"procedure {procedure.group(1)} is not on the read-only allow-list"
+    return None
 
 
 def canonical_label(label: str) -> str:
@@ -44,169 +167,402 @@ def canonical_label(label: str) -> str:
     return _ident(label.strip()[:1].upper() + label.strip()[1:], "label")
 
 
-class Graph:
-    def __init__(self, uri: str, user: str, password: str, database: Optional[str] = None,
-                 timeout: float = 3.0):
-        from neo4j import GraphDatabase  # lazy: is_available() must not import it
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-        # notifications off: optional properties such as ``aliases`` raise UnknownPropertyKey
-        # warnings on every recall until the first node carrying them exists.
-        self._driver = GraphDatabase.driver(uri, auth=(user, password), connection_timeout=timeout,
-                                            notifications_min_severity="OFF")
-        self._database = database or None
-        self._timeout = timeout
+
+def _node_props(memory: Dict[str, Any]) -> Dict[str, Any]:
+    """A server memory minus its ``_id``/``_labels``/``_score`` metadata."""
+    return {k: v for k, v in (memory or {}).items() if not k.startswith("_")}
+
+
+def _node_label(memory: Dict[str, Any]) -> str:
+    labels = (memory or {}).get("_labels") or []
+    return labels[0] if labels else "Memory"
+
+
+def _is_archived(props: Dict[str, Any]) -> bool:
+    return str(props.get("status", "")).lower() == "archived"
+
+
+class Graph:
+    """Reverie's graph verbs, each one or two MCP tool calls.
+
+    Args:
+        client: a started-on-demand :class:`~reverie.mcp_client.MCPClient`.
+        search_mode: default mode for recall (``hybrid``, ``keyword`` or ``semantic``).
+        similarity_threshold: semantic cut-off passed to the server (it defaults to 0.4).
+        depth: relationship depth included with each recalled entity (0-5).
+    """
+
+    def __init__(
+        self,
+        client: MCPClient,
+        search_mode: str = "hybrid",
+        similarity_threshold: Optional[float] = None,
+        depth: int = 1,
+    ) -> None:
+        self.client = client
+        if search_mode not in SEARCH_MODES:
+            raise ValueError(f"invalid search_mode: {search_mode!r} — one of {', '.join(SEARCH_MODES)}")
+        self.search_mode = search_mode
+        self.similarity_threshold = similarity_threshold
+        self.depth = max(0, min(5, int(depth)))
 
     @classmethod
-    def from_env(cls) -> "Graph":
+    def from_env(cls, config: Optional[Dict[str, Any]] = None) -> "Graph":
+        """Build a graph from plugin config plus the NEO4J_*/REVERIE_* environment.
+
+        Config keys (all optional): ``server_command``, ``server_timeout``,
+        ``server_startup_timeout``, ``embeddings``, ``model_cache``, ``search_mode``,
+        ``similarity_threshold``, ``recall_depth``.
+        """
+        config = config or {}
+        extra_env: Dict[str, Any] = {}
+        embeddings = config.get("embeddings")
+        if embeddings:
+            if str(embeddings).lower() not in EMBEDDING_PROVIDERS:
+                raise ValueError(
+                    f"invalid embeddings provider: {embeddings!r} — one of {', '.join(EMBEDDING_PROVIDERS)}")
+            extra_env["REVERIE_EMBEDDINGS"] = str(embeddings).lower()
+        if config.get("model_cache"):
+            extra_env["REVERIE_MODEL_CACHE"] = config["model_cache"]
+        client = MCPClient(
+            command=config.get("server_command") or DEFAULT_SERVER_COMMAND,
+            env=server_env_from_environ(extra_env),
+            timeout=float(config.get("server_timeout", 30.0)),
+            startup_timeout=float(config.get("server_startup_timeout", 60.0)),
+        )
+        # Validate here, once, rather than failing the same way on every recall.
+        mode = str(config.get("search_mode") or "hybrid")
+        if mode not in SEARCH_MODES:
+            raise ValueError(f"invalid search_mode: {mode!r} — one of {', '.join(SEARCH_MODES)}")
         return cls(
-            uri=os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687"),
-            user=os.environ.get("NEO4J_USERNAME", "neo4j"),
-            password=os.environ["NEO4J_PASSWORD"],
-            database=os.environ.get("NEO4J_DATABASE") or None,
+            client,
+            search_mode=mode,
+            similarity_threshold=_threshold(config.get("similarity_threshold")),
+            depth=_int_in_range(config.get("recall_depth", 1), 0, SEARCH_MAX_DEPTH, "recall_depth"),
         )
 
     def close(self) -> None:
         try:
-            self._driver.close()
+            self.client.stop()
         except Exception:
             pass
 
-    # -- low level ---------------------------------------------------------
-    def run(self, cypher: str, **params: Any) -> List[Dict[str, Any]]:
-        with self._driver.session(database=self._database) as session:
-            result = session.run(cypher, **params, timeout=self._timeout)
-            return [record.data() for record in result]
-
     def ping(self) -> bool:
-        try:
-            return self.run("RETURN 1 AS ok")[0]["ok"] == 1
-        except Exception as exc:
-            logger.debug("Reverie ping failed: %s", exc)
-            return False
+        return self.client.ping()
+
+    # -- low level ---------------------------------------------------------
+    def call(self, tool: str, **arguments: Any) -> Any:
+        """One tool call, with None arguments dropped (the server's schemas are strict)."""
+        payload = {k: v for k, v in arguments.items() if v is not None}
+        return self.client.call_tool(tool, payload)
 
     # -- recall ------------------------------------------------------------
-    def recall(self, terms: Iterable[str], limit: int = 5) -> List[Dict[str, Any]]:
-        """Nodes whose name/aliases/email contain any term (case-insensitive), with 1-hop neighbours."""
-        terms = [t.lower() for t in terms if t]
+    def search_memories(
+        self,
+        query: str,
+        limit: int = 10,
+        label: Optional[str] = None,
+        depth: Optional[int] = None,
+        search_mode: Optional[str] = None,
+        similarity_threshold: Optional[float] = None,
+        since_date: Optional[str] = None,
+        order_by: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Raw ``search_memories`` rows: ``{memory: {...}, connections: [...]}``.
+
+        Arguments are validated here, to the same rules the server enforces, so a bad call fails
+        with a message Hermes can act on instead of a rejected tool call.
+        """
+        mode = search_mode or self.search_mode
+        if mode not in SEARCH_MODES:
+            raise ValueError(f"invalid search_mode: {mode!r} — one of {', '.join(SEARCH_MODES)}")
+        if label is not None and not isinstance(label, str):
+            raise ValueError(f"invalid label: {label!r} — must be text")
+        rows = self.call(
+            "search_memories",
+            query=str(query or ""),
+            label=label or None,  # the server matches the label case-insensitively
+            depth=self.depth if depth is None else _int_in_range(depth, 0, SEARCH_MAX_DEPTH, "depth"),
+            limit=_int_in_range(limit, 1, SEARCH_MAX_LIMIT, "limit"),
+            search_mode=mode,
+            similarity_threshold=_threshold(
+                self.similarity_threshold if similarity_threshold is None else similarity_threshold
+            ),
+            since_date=since_date,
+            order_by=order_by,
+        )
+        return rows if isinstance(rows, list) else []
+
+    def recall(
+        self,
+        terms: Iterable[str],
+        limit: int = 5,
+        label: Optional[str] = None,
+        depth: Optional[int] = None,
+        search_mode: Optional[str] = None,
+        similarity_threshold: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """Entities matching any of ``terms``, with their neighbours.
+
+        The terms are joined into one query: the server's keyword pass matches a node when any
+        word of the query appears in any of its content properties, which is the OR the old
+        Cypher did, in a single round trip. In hybrid mode the semantic pass then adds close
+        variants ("Ben Weeks" finding "Benjamin Weeks") that keywords miss. Archived nodes are
+        dropped, as they always were.
+        """
+        terms = [str(t).strip() for t in terms if t and str(t).strip()]
         if not terms:
             return []
-        rows = self.run(
-            """
-            UNWIND $terms AS term
-            MATCH (n)
-            WHERE (n.status IS NULL OR n.status <> 'archived')
-              AND (toLower(coalesce(n.name, '')) CONTAINS term
-                   OR toLower(coalesce(n.email, '')) CONTAINS term
-                   OR any(a IN coalesce(n.aliases, []) WHERE toLower(toString(a)) CONTAINS term))
-            WITH DISTINCT n
-            OPTIONAL MATCH (n)-[r]-(m)
-            WITH n, collect({type: type(r), out: startNode(r) = n, name: m.name, label: head(labels(m))})[..8] AS rels
-            RETURN elementId(n) AS id, head(labels(n)) AS label, properties(n) AS props, rels
-            LIMIT $limit
-            """,
-            terms=terms, limit=int(limit),
+        # Ask for more than we need: archived nodes are filtered client-side.
+        rows = self.search_memories(
+            " ".join(terms),
+            limit=_int_in_range(int(limit) * 2, 1, SEARCH_MAX_LIMIT, "limit"),
+            label=label,
+            depth=depth,
+            search_mode=search_mode,
+            similarity_threshold=similarity_threshold,
         )
-        return rows
+        hits: List[Dict[str, Any]] = []
+        seen: set = set()
+        for hit in (self._to_hit(row) for row in rows):
+            if hit is None or _is_archived(hit["props"]) or hit["id"] in seen:
+                continue
+            seen.add(hit["id"])
+            hits.append(hit)
+            if len(hits) >= int(limit):
+                break
+        return hits
 
-    # -- writes ------------------------------------------------------------
-    def remember(self, label: str, name: str, props: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """MERGE by case-insensitive name within the label; update properties; stamp timestamps."""
-        label = canonical_label(label)
-        props = {k: v for k, v in (props or {}).items() if k not in ("name",) and v is not None}
-        now = int(time.time())
-        rows = self.run(
-            f"""
-            OPTIONAL MATCH (e:{label}) WHERE toLower(e.name) = toLower($name)
-            WITH e LIMIT 1
-            CALL {{
-              WITH e
-              WITH e WHERE e IS NULL
-              CREATE (c:{label} {{name: $name, created_at: $now}})
-              RETURN c AS node
-              UNION
-              WITH e
-              WITH e WHERE e IS NOT NULL
-              RETURN e AS node
-            }}
-            SET node += $props, node.updated_at = $now
-            RETURN elementId(node) AS id, head(labels(node)) AS label, properties(node) AS props
-            """,
-            name=name.strip(), props=props, now=now,
-        )
-        if not rows:
-            raise RuntimeError("remember matched nothing and created nothing")
-        return rows[0]
+    @staticmethod
+    def _to_hit(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """One search row in the shape the provider renders: ``{id, label, props, rels, score, match}``.
 
-    def connect(self, from_name: str, to_name: str, rel_type: str,
-                props: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        rel_type = _ident(rel_type.upper(), "relationship type")
-        rows = self.run(
-            f"""
-            MATCH (a) WHERE toLower(a.name) = toLower($from_name)
-            MATCH (b) WHERE toLower(b.name) = toLower($to_name)
-            WITH a, b LIMIT 1
-            MERGE (a)-[r:{rel_type}]->(b)
-            SET r += $props, r.updated_at = $now
-            RETURN a.name AS from, type(r) AS type, b.name AS to, properties(r) AS props
-            """,
-            from_name=from_name.strip(), to_name=to_name.strip(), props=props or {}, now=int(time.time()),
-        )
-        if not rows:
-            raise RuntimeError(f"connect: '{from_name}' or '{to_name}' not found — remember them first")
-        return rows[0]
-
-    def forget(self, name: str) -> int:
-        """Soft delete: archived nodes stop being recalled but keep their history."""
-        rows = self.run(
-            "MATCH (n) WHERE toLower(n.name) = toLower($name) SET n.status = 'archived', n.archived_at = $now RETURN count(n) AS n",
-            name=name.strip(), now=int(time.time()),
-        )
-        return int(rows[0]["n"]) if rows else 0
+        ``rels`` keeps the old key names. Direction is not recoverable from the server's
+        scrubbed relationship objects (they carry properties, ``_id`` and ``_type`` only), so
+        ``out`` is always True and neighbours read as "TYPE Other".
+        """
+        if not isinstance(row, dict):
+            return None
+        memory = row.get("memory")
+        if not isinstance(memory, dict):
+            return None
+        rels: List[Dict[str, Any]] = []
+        for conn in row.get("connections") or []:
+            if not isinstance(conn, dict):
+                continue
+            other = conn.get("memory")
+            rel = conn.get("relationship")
+            if not isinstance(other, dict) or not isinstance(rel, dict):
+                continue
+            rels.append({
+                "type": rel.get("_type"),
+                "out": True,
+                "name": other.get("name"),
+                "label": _node_label(other),
+                "distance": conn.get("distance"),
+            })
+        return {
+            "id": memory.get("_id"),
+            "label": _node_label(memory),
+            "props": _node_props(memory),
+            "rels": rels[:MAX_RELS],
+            "score": memory.get("_score"),
+            "match": memory.get("_match"),
+        }
 
     def probe(self, name: str) -> List[Dict[str, Any]]:
         return self.recall([name.strip()], limit=3)
 
-    def read_cypher(self, cypher: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        if WRITE_RE.search(cypher):
-            raise ValueError("cypher action is read-only; use remember/connect/forget for writes")
-        return self.run(cypher, **(params or {}))
+    def find_all(self, name: str, label: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Every live node whose ``name`` equals ``name``, case-insensitively.
 
-    # -- dreaming ----------------------------------------------------------
-    def dream(self) -> Dict[str, Any]:
-        """Deterministic hygiene: merge case-duplicate names within a label, canonicalise
-        lowercase labels, count orphans. The LLM-driven part of Dreaming (reading the day's
-        conversations and extracting new entities) lives in the skill, not here."""
-        report: Dict[str, Any] = {"relabelled": 0, "merged": 0, "orphans": 0}
-        for row in self.run("CALL db.labels() YIELD label RETURN label"):
-            label = row["label"]
-            canon = canonical_label(label) if label.lower() in [c.lower() for c in CANONICAL_LABELS] else None
-            if canon and canon != label:
-                n = self.run(f"MATCH (n:`{label}`) REMOVE n:`{label}` SET n:{canon} RETURN count(n) AS n")
-                report["relabelled"] += int(n[0]["n"]) if n else 0
-        for label in CANONICAL_LABELS:
-            dupes = self.run(
-                f"""
-                MATCH (n:{label}) WITH toLower(n.name) AS key, collect(n) AS nodes
-                WHERE size(nodes) > 1 RETURN key, [x IN nodes | elementId(x)] AS ids
-                """
+        This is the dedupe step in front of every write: the graph must never grow a second
+        "Atlantic Pharma" because the agent typed it differently. The label, when given, is
+        pushed down to the server so a common first name cannot crowd the real node out of the
+        page — and it narrows what "the node called X" means when several labels share a name.
+        """
+        wanted = (name or "").strip().lower()
+        if not wanted:
+            return []
+        rows = self.search_memories(name.strip(), label=label, **NAME_SEARCH)
+        wanted_label = (label or "").strip().lower()
+        matches: List[Dict[str, Any]] = []
+        for row in rows:
+            hit = self._to_hit(row)
+            if hit is None or _is_archived(hit["props"]):
+                continue
+            if str(hit["props"].get("name", "")).strip().lower() != wanted:
+                continue
+            if wanted_label and hit["label"].lower() != wanted_label:
+                continue
+            matches.append(hit)
+        return matches
+
+    def find(self, name: str, label: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """The node whose ``name`` equals ``name`` case-insensitively, or None.
+
+        Several matches mean the graph holds duplicates (Dreaming merges them); the first is
+        used, as it always was. Use :meth:`find_all` where ambiguity must be refused instead.
+        """
+        matches = self.find_all(name, label=label)
+        if len(matches) > 1:
+            logger.debug("Reverie: %r matches %d memories; using the first", name, len(matches))
+        return matches[0] if matches else None
+
+    def resolve(self, name: str, label: Optional[str] = None, what: str = "entity") -> Dict[str, Any]:
+        """The one node called ``name``, or a refusal that says what to do about it.
+
+        Writing a relationship to the wrong "Ava" is worse than not writing it, so ambiguity is
+        an error here rather than a guess. The two refusals are distinct exception types —
+        :class:`MemoryNotFound` and :class:`AmbiguousMemory` — so callers branch on the type,
+        never on the wording of a message that carries a caller-supplied name.
+        """
+        matches = self.find_all(name, label=label)
+        if not matches:
+            where = f" with label {str(label).strip()}" if label else ""
+            raise MemoryNotFound(f"{what} {name!r}{where} not found — remember it first", name, label)
+        if len(matches) > 1:
+            labels = sorted({hit["label"] for hit in matches})
+            raise AmbiguousMemory(
+                f"{what} {name!r} is ambiguous: {len(matches)} memories share that name"
+                + (f" ({', '.join(labels)})" if len(labels) > 1 else "")
+                + " — say which by passing a label, or merge them with dream",
+                name, matches,
             )
-            for d in dupes:
-                keep, *rest = d["ids"]
-                for other in rest:
-                    self.run(
-                        """
-                        MATCH (keep) WHERE elementId(keep) = $keep
-                        MATCH (dup) WHERE elementId(dup) = $dup
-                        CALL apoc.refactor.mergeNodes([keep, dup], {properties: 'discard', mergeRels: true}) YIELD node
-                        RETURN node
-                        """,
-                        keep=keep, dup=other,
-                    )
-                    report["merged"] += 1
-        orphans = self.run("MATCH (n) WHERE NOT (n)--() AND (n.status IS NULL OR n.status <> 'archived') RETURN count(n) AS n")
-        report["orphans"] = int(orphans[0]["n"]) if orphans else 0
-        return report
+        return matches[0]
 
-    def stats(self) -> Dict[str, int]:
-        rows = self.run("MATCH (n) RETURN head(labels(n)) AS label, count(n) AS n ORDER BY n DESC")
-        return {r["label"] or "?": int(r["n"]) for r in rows}
+    # -- writes ------------------------------------------------------------
+    def remember(self, label: str, name: str, props: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Create or update one entity, deduped by exact (case-insensitive) name within the label."""
+        label = canonical_label(label)
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("remember needs a name")
+        props = _properties(props, "properties")
+        props = {k: v for k, v in props.items() if k != "name" and v is not None}
+
+        existing = self.find(name, label=label)
+        if existing is not None:
+            result = self.call("update_memory", nodeId=_node_id(existing["id"]),
+                               properties={**props, "updated_at": _now_iso()})
+        else:
+            result = self.call("create_memory", label=_ident(label, "label"),
+                               properties={"name": name, **props})
+        memory = (result or {}).get("memory") if isinstance(result, dict) else None
+        if not isinstance(memory, dict):
+            raise RuntimeError(f"remember: unexpected server response: {result!r}")
+        node = {"id": memory.get("_id"), "label": _node_label(memory), "props": _node_props(memory)}
+        if memory.get("_hint"):
+            node["hint"] = memory["_hint"]  # the server flags a node that has grown too many properties
+        return node
+
+    def connect(self, from_name: str, to_name: str, rel_type: str,
+                props: Optional[Dict[str, Any]] = None,
+                from_label: Optional[str] = None, to_label: Optional[str] = None) -> Dict[str, Any]:
+        """Relate two remembered entities.
+
+        ``from_label`` / ``to_label`` disambiguate an end when several memories share a name — a
+        Person and a Project both called "Atlas", say. Without them, an ambiguous name is refused
+        rather than guessed.
+        """
+        rel_type = _ident(rel_type.strip().upper(), "relationship type")
+        source = self.resolve(from_name, from_label, "connect: source")
+        target = self.resolve(to_name, to_label, "connect: target")
+        self.call(
+            "create_connection",
+            fromMemoryId=_node_id(source["id"], "fromMemoryId"),
+            toMemoryId=_node_id(target["id"], "toMemoryId"),
+            type=rel_type,
+            properties={**_properties(props, "properties"), "created_at": _now_iso()},
+        )
+        return {
+            "from": source["props"].get("name"), "type": rel_type, "to": target["props"].get("name"),
+            "props": props or {},
+        }
+
+    def forget(self, name: str, hard: bool = False) -> int:
+        """Archive an entity — or delete it outright with ``hard=True``.
+
+        Archiving stays the default so ``forget`` keeps the behaviour SOUL and the skills expect:
+        the node stops being recalled (recall drops ``status = 'archived'``) but its history and
+        relationships survive. ``hard`` maps to the server's ``delete_memory``, which detaches
+        and deletes.
+        """
+        hit = self.find(name)
+        if hit is None:
+            return 0
+        if hard:
+            result = self.call("delete_memory", nodeId=_node_id(hit["id"]))
+            return int((result or {}).get("deletedCount", 0)) if isinstance(result, dict) else 0
+        self.call(
+            "update_memory", nodeId=_node_id(hit["id"]),
+            properties={"status": "archived", "archived_at": _now_iso()},
+        )
+        return 1
+
+    def forget_connection(self, from_name: str, to_name: str, rel_type: str,
+                          from_label: Optional[str] = None, to_label: Optional[str] = None) -> int:
+        """Delete one relationship (the server has no soft delete for relationships).
+
+        Both ends take an optional label, for the same reason ``connect`` does: deleting the
+        wrong "Atlas" edge is not undoable. An end that matches nothing is a no-op; an end that
+        matches several memories is refused.
+        """
+        rel_type = _ident(rel_type.strip().upper(), "relationship type")
+        try:
+            source = self.resolve(from_name, from_label, "forget: source")
+            target = self.resolve(to_name, to_label, "forget: target")
+        except MemoryNotFound:
+            return 0  # nothing to disconnect; an ambiguous end still raises
+        result = self.call(
+            "delete_connection",
+            fromMemoryId=_node_id(source["id"], "fromMemoryId"),
+            toMemoryId=_node_id(target["id"], "toMemoryId"),
+            type=rel_type,
+        )
+        return int((result or {}).get("deletedCount", 0)) if isinstance(result, dict) else 0
+
+    # -- read-only Cypher --------------------------------------------------
+    def read_cypher(self, cypher: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Read-only Cypher via ``query_memories``.
+
+        The same guard the server applies (comments stripped first, write clauses refused, CALL
+        only for the read-only ``db.*`` procedures) runs here so the agent gets the reason back
+        without a round trip. The server still runs the query in a READ transaction, capped at
+        200 rows and 10 seconds.
+        """
+        if not isinstance(cypher, str) or not cypher.strip():
+            raise ValueError("cypher action needs a query")
+        violation = read_only_violation(cypher)
+        if violation:
+            raise ValueError(f"cypher action is read-only: {violation}; use remember/connect/forget for writes")
+        if params is not None and not isinstance(params, dict):
+            raise ValueError("cypher params must be an object")
+        rows = self.call("query_memories", cypher=cypher, params=params or None)
+        return rows if isinstance(rows, list) else ([] if rows is None else [rows])
+
+    # -- dreaming and stats ------------------------------------------------
+    def dream(self, dry_run: bool = False) -> Dict[str, Any]:
+        """Server-side hygiene: relabel lowercase labels, merge duplicates, re-embed, report bloat.
+
+        The report carries ``relabelled``, ``merged``, ``reembedded``, ``orphans``,
+        ``duplicates`` (each ``{label, name, keep, merged[], skipped[{id, reason}]}``),
+        ``bloated`` (nodes past ``REVERIE_MAX_PROPERTIES``), ``apoc_available`` and ``notes``.
+        """
+        result = self.call("dream", dry_run=bool(dry_run))
+        return result if isinstance(result, dict) else {"result": result}
+
+    def stats(self) -> Dict[str, Any]:
+        """Graph counts: ``nodes``, ``relationships``, ``labels``, ``relationship_types``, ``embedded``, ``orphans``."""
+        result = self.call("memory_stats")
+        return result if isinstance(result, dict) else {}
+
+
+__all__ = [
+    "AmbiguousMemory", "CANONICAL_LABELS", "DEFAULT_SERVER_COMMAND", "EMBEDDING_PROVIDERS",
+    "Graph", "MCPClient", "MCPError", "MCPToolError", "MemoryNotFound", "canonical_label",
+    "read_only_violation",
+]

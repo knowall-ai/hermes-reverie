@@ -1,7 +1,10 @@
 """Reverie tests. The provider imports Hermes internals (agent.memory_provider), which are
-stubbed here so the plugin loads standalone; graph tests need a live Neo4j (NEO4J_PASSWORD)."""
+stubbed here so the plugin loads standalone; the live test needs the mcp-reverie server on PATH
+and a Neo4j behind it (NEO4J_PASSWORD). The MCP client and the graph adapter are covered
+without either, against tests/fake_mcp_server.py."""
 import importlib.util
 import os
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -79,14 +82,20 @@ def test_provider_reports_unavailable_without_password(monkeypatch):
     assert provider.get_tool_schemas()[0]["name"] == "reverie"
 
 
-@pytest.mark.skipif(not os.environ.get("NEO4J_PASSWORD"), reason="needs a live Neo4j")
+@pytest.mark.skipif(
+    not (os.environ.get("NEO4J_PASSWORD") and shutil.which("reverie")),
+    reason="needs the mcp-reverie server on PATH and a live Neo4j behind it",
+)
 def test_live_roundtrip():
     g = Graph.from_env()
     assert g.ping()
+    created = []
     try:
         node = g.remember("Person", "Reverie Test Person", {"role": "tester"})
+        created.append(node["id"])
         assert node["props"]["name"] == "Reverie Test Person"
         org = g.remember("organisation", "Reverie Test Org")
+        created.append(org["id"])
         assert org["label"] == "Organization"
         rel = g.connect("reverie test person", "REVERIE TEST ORG", "works_at", {"since": "2026"})
         assert rel["type"] == "WORKS_AT"
@@ -94,12 +103,15 @@ def test_live_roundtrip():
         assert any(h["props"]["name"] == "Reverie Test Person" for h in hits)
         assert any(r["type"] == "WORKS_AT" for h in hits for r in h["rels"])
         # remember again must update, not duplicate
-        g.remember("person", "reverie test person", {"role": "lead tester"})
-        assert len([h for h in g.recall(["reverie test person"]) if h["label"] == "Person"]) == 1
+        again = g.remember("person", "reverie test person", {"role": "lead tester"})
+        assert again["id"] == node["id"]
         assert g.forget("Reverie Test Person") == 1
         assert not any(h["props"]["name"] == "Reverie Test Person" for h in g.recall(["reverie test person"]))
-        report = g.dream()
-        assert set(report) == {"relabelled", "merged", "orphans"}
+        report = g.dream(dry_run=True)
+        assert {"relabelled", "merged", "orphans"} <= set(report)
     finally:
-        g.run("MATCH (n) WHERE n.name STARTS WITH 'Reverie Test' DETACH DELETE n")
+        # By node id: forget() resolves names through find(), which skips the node this test
+        # archived, so a name-based cleanup would silently leave it behind.
+        for node_id in created:
+            g.call("delete_memory", nodeId=node_id)
         g.close()

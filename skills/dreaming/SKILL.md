@@ -41,9 +41,15 @@ For every entity worth keeping, use the `reverie` tool:
 
 ## 3. Tidy
 
-Run `reverie` action `dream`. It merges case-duplicate names, fixes lowercase labels and
-reports orphans. Look at the orphans: connect the ones you can, `forget` the ones that were
-noise.
+Run `reverie` action `dream` — `dry_run: true` first if you want to see the plan before it
+writes. It merges duplicate names (skipping any pair whose email, phone or company disagree),
+fixes lowercase labels, refreshes embeddings, and reports `orphans`, `duplicates` and `bloated`.
+
+- **orphans:** connect the ones you can, `forget` the ones that were noise.
+- **duplicates:** each entry lists what was merged and what was `skipped`, with the reason —
+  a skipped pair is usually two real people who share a name; leave them alone.
+- **bloated:** nodes carrying too many properties. Fold their dated facts into a short
+  attribute, a relationship, or your notes.
 
 ## 4. Find connections
 

@@ -1,13 +1,19 @@
 """Reverie — KnowAll graph memory that dreams (Hermes memory-provider plugin).
 
 Recall: before every non-trivial turn the prompt's names, emails and quoted phrases are
-matched against the Neo4j graph and the hits, with their relationships, are injected as
-context. Store: the agent writes through the ``reverie`` tool (remember / connect / forget)
-so the graph only ever holds curated entities, never raw chat. Dreaming: the nightly
-consolidation skill installed by ``post_setup`` reviews the day and tidies the graph.
+matched against the graph and the hits, with their relationships, are injected as context.
+Store: the agent writes through the ``reverie`` tool (remember / connect / forget) so the graph
+only ever holds curated entities, never raw chat. Dreaming: the nightly consolidation skill
+installed by ``post_setup`` reviews the day and tidies the graph.
 
-Config: ``plugins.reverie`` in config.yaml (recall_limit, recall_labels); secrets in .env
-(NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, NEO4J_DATABASE).
+The graph itself lives behind the `mcp-reverie <https://github.com/knowall-ai/mcp-reverie>`_
+MCP server (binary ``reverie``), which this plugin spawns and talks to over stdio — see
+``mcp_client.py`` and ``graph.py``. Nothing here speaks Bolt, so search (hybrid keyword +
+semantic), Dreaming and the graph conventions are shared with every other Reverie client.
+
+Config: ``plugins.reverie`` in config.yaml (recall_limit, server_command, embeddings,
+search_mode, …); secrets in .env (NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, NEO4J_DATABASE),
+which are passed through to the server process.
 """
 from __future__ import annotations
 
@@ -15,6 +21,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -22,7 +29,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
 
-from .graph import CANONICAL_LABELS, Graph, canonical_label
+from .graph import CANONICAL_LABELS, DEFAULT_SERVER_COMMAND, Graph
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +72,33 @@ def recall_terms(text: str, max_terms: int = 8) -> List[str]:
     return terms[:max_terms]
 
 
+#: Boolean arguments the ``reverie`` tool accepts. Each one flips a destructive or
+#: behaviour-changing switch, so each is validated rather than coerced.
+BOOLEAN_ARGS = ("hard", "dry_run")
+
+
+def _as_bool(value: Any, name: str, default: bool = False) -> bool:
+    """A tool argument as a real boolean, or a refusal.
+
+    ``bool(value)`` is not usable here: a model that emits JSON by hand writes ``"hard": "false"``
+    often enough, and every non-empty string is truthy — so "false" would hard-delete the node.
+    Real booleans pass; the strings "true"/"false" are accepted case-insensitively and with
+    surrounding whitespace trimmed, because they are unambiguous; everything else ("yes", "0", 1,
+    "") is refused, because guessing at
+    what a caller meant is how a soft archive becomes a permanent delete.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    raise ValueError(
+        f"{name} must be true or false, not {value!r} — use a JSON boolean (or the string "
+        '"true" / "false")'
+    )
+
+
 def _load_plugin_config() -> dict:
     try:
         from hermes_cli.config import cfg_get, load_config_readonly
@@ -79,15 +113,24 @@ REVERIE_TOOL = {
         "Reverie: your knowledge graph of people, organisations, projects, products, concepts, "
         "meetings and decisions. Recall happens automatically before each turn; use this tool to "
         "look deeper or to write.\n\nACTIONS:\n"
-        "• search — find nodes by name/alias/email (case-insensitive).\n"
+        "• search — hybrid keyword + semantic search, so 'Ben Weeks' also finds 'Benjamin Weeks'. "
+        "Optional search_mode (hybrid | keyword | semantic) and similarity_threshold (0-1, default 0.4) "
+        "tune it: keyword for exact lookups, semantic for 'who else is like this', a higher threshold "
+        "for fewer, closer matches.\n"
         "• probe — everything about one entity and its relationships.\n"
-        "• remember — create or update an entity: label + name + properties (role, email, company, notes).\n"
+        "• remember — create or update an entity: label + name + properties (role, email, company, notes). "
+        "An existing entity with the same name is updated, never duplicated.\n"
         "• connect — relate two remembered entities: from, to, type (WORKS_AT, HAS_ROLE, PARTNERS_WITH, "
-        "INTRODUCED_BY, INTERESTED_IN, MET_WITH, DISCUSSED, DECIDED, OWNS, BLOCKED_BY) and properties.\n"
-        "• forget — archive an entity (soft delete).\n"
+        "INTRODUCED_BY, INTERESTED_IN, MET_WITH, DISCUSSED, DECIDED, OWNS, BLOCKED_BY) and properties. "
+        "If a name matches more than one memory the call is refused, not guessed — say which with "
+        "from_label / to_label.\n"
+        "• forget — archive an entity by name (soft delete); with hard=true delete it outright. To "
+        "delete one relationship instead, pass from, to and type together — half of them is refused, "
+        "not treated as an entity delete.\n"
         "• cypher — read-only Cypher for anything else.\n"
-        "• stats — node counts by label.\n"
-        "• dream — run graph hygiene (merge case-duplicates, fix labels, count orphans).\n\n"
+        "• stats — node, relationship, label and orphan counts.\n"
+        "• dream — run graph hygiene (merge duplicates, fix labels, refresh embeddings, report bloated "
+        "nodes); dry_run=true reports without writing.\n\n"
         "Search before you remember: never create a person or organisation that already exists under "
         "another spelling. Labels are capitalised singular. Store facts, not chat."
     ),
@@ -99,10 +142,20 @@ REVERIE_TOOL = {
             "name": {"type": "string", "description": "entity name for probe/remember/forget"},
             "label": {"type": "string", "description": "Person | Organization | Project | Product | Concept | Meeting | Decision | Risk"},
             "properties": {"type": "object", "description": "properties to set on the entity or relationship"},
-            "from": {"type": "string", "description": "connect: source entity name"},
-            "to": {"type": "string", "description": "connect: target entity name"},
-            "type": {"type": "string", "description": "connect: relationship type in UPPER_SNAKE"},
-            "limit": {"type": "integer", "description": "max results (default 10)"},
+            "from": {"type": "string", "description": "connect/forget: source entity name"},
+            "to": {"type": "string", "description": "connect/forget: target entity name"},
+            "from_label": {"type": "string", "description": "connect/forget: label of the source, when the name alone is ambiguous"},
+            "to_label": {"type": "string", "description": "connect/forget: label of the target, when the name alone is ambiguous"},
+            "type": {"type": "string", "description": "connect/forget: relationship type in UPPER_SNAKE"},
+            "limit": {"type": "integer", "description": "max results (default 10)", "minimum": 1},
+            "search_mode": {"type": "string", "enum": ["hybrid", "keyword", "semantic"],
+                            "description": "search: hybrid (default), keyword-only or semantic-only"},
+            "similarity_threshold": {"type": "number", "minimum": 0, "maximum": 1,
+                                     "description": "search: semantic cut-off, 0-1 (server default 0.4)"},
+            "depth": {"type": "integer", "minimum": 0, "maximum": 5,
+                      "description": "search: relationship hops to include (default 1)"},
+            "hard": {"type": "boolean", "description": "forget: delete instead of archiving (true or false, never a word like 'yes')"},
+            "dry_run": {"type": "boolean", "description": "dream: report planned changes without writing (true or false)"},
         },
         "required": ["action"],
     },
@@ -121,28 +174,57 @@ class ReverieMemoryProvider(MemoryProvider):
     def name(self) -> str:
         return "reverie"
 
-    def is_available(self) -> bool:
+    def _server_command(self) -> str:
+        return str(self._config.get("server_command") or DEFAULT_SERVER_COMMAND)
+
+    def _server_argv(self) -> List[str]:
+        """The configured command as argv, or [] when it is unparseable (an unbalanced quote)."""
         try:
-            import neo4j  # noqa: F401
-        except Exception:
+            return shlex.split(self._server_command())
+        except ValueError as exc:
+            logger.warning("Reverie: server_command %r cannot be parsed: %s",
+                           self._server_command(), exc)
+            return []
+
+    def is_available(self) -> bool:
+        command = self._server_argv()
+        if not command or not shutil.which(command[0]):
             return False
         return bool(os.environ.get("NEO4J_PASSWORD"))
 
     def unavailable_reason(self) -> str:
-        return "Reverie needs the neo4j driver and NEO4J_PASSWORD (plus NEO4J_URI if not bolt://127.0.0.1:7687) in .env"
+        command = self._server_argv()
+        if not command:
+            return (f"Reverie's server_command is not a valid command line: "
+                    f"{self._server_command()!r} — check the quoting in config.yaml")
+        if not shutil.which(command[0]):
+            return (f"Reverie needs the mcp-reverie server on PATH (looked for '{command[0]}'): "
+                    "npm install -g github:knowall-ai/mcp-reverie")
+        return "Reverie needs NEO4J_PASSWORD (plus NEO4J_URI if not bolt://127.0.0.1:7687) in .env"
 
     # -- setup -------------------------------------------------------------
     def get_config_schema(self):
         return [
-            {"key": "NEO4J_URI", "description": "Bolt URI", "default": "bolt://127.0.0.1:7687", "secret": True, "env_var": "NEO4J_URI"},
+            {"key": "NEO4J_URI", "description": "Bolt URI (passed to the MCP server)", "default": "bolt://127.0.0.1:7687", "secret": True, "env_var": "NEO4J_URI"},
             {"key": "NEO4J_USERNAME", "description": "Neo4j user", "default": "neo4j", "secret": True, "env_var": "NEO4J_USERNAME"},
             {"key": "NEO4J_PASSWORD", "description": "Neo4j password", "required": True, "secret": True, "env_var": "NEO4J_PASSWORD"},
+            {"key": "server_command", "description": "mcp-reverie server command", "default": DEFAULT_SERVER_COMMAND},
+            {"key": "embeddings", "description": "Embeddings for semantic search: local, openai, azure, ollama, voyage or none", "default": "local"},
+            {"key": "search_mode", "description": "Recall mode: hybrid, keyword or semantic", "default": "hybrid"},
+            {"key": "similarity_threshold", "description": "Semantic similarity cut-off, 0-1 (blank = the server's 0.4)", "default": ""},
             {"key": "recall_limit", "description": "Entities recalled per turn", "default": "5", "type": "integer", "minimum": 1, "maximum": 20},
+            {"key": "recall_depth", "description": "Relationship hops recalled with each entity", "default": "1", "type": "integer", "minimum": 0, "maximum": 5},
+            {"key": "server_timeout", "description": "Seconds to wait for a tool call", "default": "30"},
+            {"key": "server_startup_timeout", "description": "Seconds to wait for the server handshake (the local embedding model downloads on first use)", "default": "60"},
             {"key": "dreaming_schedule", "description": "Cron schedule for nightly Dreaming (blank = don't install)", "default": "0 3 * * *"},
         ]
 
+    CONFIG_KEYS = ("recall_limit", "dreaming_schedule", "server_command", "embeddings", "search_mode",
+                   "similarity_threshold", "recall_depth", "server_timeout", "server_startup_timeout",
+                   "model_cache")
+
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
-        keep = {k: v for k, v in values.items() if k in ("recall_limit", "dreaming_schedule")}
+        keep = {k: v for k, v in values.items() if k in self.CONFIG_KEYS}
         try:
             import yaml
             from hermes_cli.config import read_user_config_raw
@@ -189,11 +271,12 @@ class ReverieMemoryProvider(MemoryProvider):
         self._session_id = session_id
         self._context = kwargs.get("agent_context", "primary")
         try:
-            self._graph = Graph.from_env()
+            self._graph = Graph.from_env(self._config)
             if not self._graph.ping():
-                logger.warning("Reverie: Neo4j did not answer at %s", os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687"))
+                logger.warning("Reverie: the mcp-reverie server (%s) did not answer; is Neo4j up at %s?",
+                               self._server_command(), os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687"))
         except Exception as exc:
-            logger.warning("Reverie: could not connect to Neo4j: %s", exc)
+            logger.warning("Reverie: could not start the mcp-reverie server: %s", exc)
             self._graph = None
 
     def shutdown(self) -> None:
@@ -205,8 +288,7 @@ class ReverieMemoryProvider(MemoryProvider):
         if not self._graph:
             return ""
         try:
-            counts = self._graph.stats()
-            total = sum(counts.values())
+            total = int(self._graph.stats().get("nodes", 0))
         except Exception:
             total = 0
         head = f"{GLYPH} Reverie graph memory is active ({total} entities)." if total else \
@@ -262,12 +344,22 @@ class ReverieMemoryProvider(MemoryProvider):
         if tool_name != "reverie":
             return json.dumps({"error": f"unknown tool {tool_name}"})
         if not self._graph:
-            return json.dumps({"error": "Reverie is not connected to Neo4j"})
+            return json.dumps({"error": "Reverie is not connected to its graph server"})
         action = args.get("action")
-        limit = int(args.get("limit", 10))
         try:
+            limit = int(args.get("limit", 10))
+            if limit < 1:
+                return json.dumps({"error": f"limit must be a positive integer, not {limit}"})
+            for flag in BOOLEAN_ARGS:
+                if flag in args:
+                    _as_bool(args[flag], f"'{flag}'")
             if action == "search":
-                return json.dumps({"results": self._graph.recall([args.get("query", "")], limit=limit)}, default=str)
+                results = self._graph.recall(
+                    [args.get("query", "")], limit=limit, label=args.get("label"),
+                    depth=args.get("depth"), search_mode=args.get("search_mode"),
+                    similarity_threshold=args.get("similarity_threshold"),
+                )
+                return json.dumps({"results": results}, default=str)
             if action == "probe":
                 return json.dumps({"results": self._graph.probe(args.get("name") or args.get("query", ""))}, default=str)
             if action == "remember":
@@ -279,15 +371,39 @@ class ReverieMemoryProvider(MemoryProvider):
                 for k in ("from", "to", "type"):
                     if not args.get(k):
                         return json.dumps({"error": f"connect needs '{k}'"})
-                return json.dumps({"connected": self._graph.connect(args["from"], args["to"], args["type"], args.get("properties"))}, default=str)
+                connected = self._graph.connect(
+                    args["from"], args["to"], args["type"], args.get("properties"),
+                    from_label=args.get("from_label"), to_label=args.get("to_label"),
+                )
+                return json.dumps({"connected": connected}, default=str)
             if action == "forget":
-                return json.dumps({"archived": self._graph.forget(args.get("name", ""))})
+                # 'from'/'to'/'type' mean "delete this relationship". Half of them is a mistake,
+                # and falling through would archive an entity instead — say so rather than guess.
+                edge = {k: args.get(k) for k in ("from", "to", "type")}
+                given = [k for k, v in edge.items() if v]
+                if given and len(given) < 3:
+                    missing = [k for k in ("from", "to", "type") if k not in given]
+                    return json.dumps({"error": (
+                        "forget: to delete a relationship give 'from', 'to' and 'type' together "
+                        f"(missing {', '.join(repr(m) for m in missing)}); to archive an entity "
+                        "give 'name' on its own")})
+                if given:
+                    deleted = self._graph.forget_connection(
+                        edge["from"], edge["to"], edge["type"],
+                        from_label=args.get("from_label"), to_label=args.get("to_label"),
+                    )
+                    return json.dumps({"disconnected": deleted})
+                if not args.get("name"):
+                    return json.dumps({"error": "forget needs 'name', or 'from'+'to'+'type'"})
+                hard = _as_bool(args.get("hard"), "forget: 'hard'")
+                return json.dumps({"archived": self._graph.forget(args["name"], hard=hard)})
             if action == "cypher":
                 return json.dumps({"rows": self._graph.read_cypher(args.get("query", ""), args.get("properties"))[:limit]}, default=str)
             if action == "stats":
-                return json.dumps({"counts": self._graph.stats()})
+                return json.dumps({"counts": self._graph.stats()}, default=str)
             if action == "dream":
-                return json.dumps({"dream": self._graph.dream()})
+                dry_run = _as_bool(args.get("dry_run"), "dream: 'dry_run'")
+                return json.dumps({"dream": self._graph.dream(dry_run=dry_run)}, default=str)
             return json.dumps({"error": f"unknown action {action}"})
         except Exception as exc:
             return json.dumps({"error": str(exc)})

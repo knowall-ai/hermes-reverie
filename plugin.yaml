@@ -1,13 +1,51 @@
 name: reverie
-version: 0.1.0
-description: "Reverie — KnowAll graph memory that dreams. Neo4j knowledge graph (people, organisations, projects, concepts, meetings) recalled before every turn, plus nightly Dreaming consolidation."
+version: 0.2.0
+description: "Reverie — KnowAll graph memory that dreams. A Neo4j knowledge graph (people, organisations, projects, concepts, meetings) behind the mcp-reverie MCP server, recalled before every turn, plus nightly Dreaming consolidation."
 author: KnowAll AI
 kind: memory
-pip_dependencies:
-  - neo4j>=5.20,<6
+# No pip dependencies: the graph is reached over stdio MCP, not the Neo4j driver.
+# The mcp-reverie server must be on PATH: npm install -g github:knowall-ai/mcp-reverie
+pip_dependencies: []
 requires_env:
   - NEO4J_PASSWORD
 optional_env:
   - NEO4J_URI
   - NEO4J_USERNAME
   - NEO4J_DATABASE
+  - REVERIE_EMBEDDINGS
+  - REVERIE_EMBEDDING_MODEL
+  - REVERIE_MODEL_CACHE
+  - REVERIE_EMBED_TIMEOUT_MS
+  - REVERIE_LAZY_EMBED_BATCH
+  - REVERIE_MAX_PROPERTIES
+config:
+  server_command:
+    description: Command that starts the mcp-reverie MCP server
+    default: reverie
+  embeddings:
+    description: "Embeddings for semantic search: local (default), openai, azure, ollama, voyage or none"
+    default: local
+  search_mode:
+    description: "Recall search mode: hybrid (default), keyword or semantic"
+    default: hybrid
+  similarity_threshold:
+    description: Semantic similarity cut-off, 0-1 (server default 0.4)
+    default: ""
+  recall_limit:
+    description: Entities recalled per turn
+    default: 5
+  recall_depth:
+    description: Relationship hops included with each recalled entity, 0-5
+    default: 1
+  server_timeout:
+    description: Seconds to wait for one MCP tool call
+    default: 30
+  server_startup_timeout:
+    description: Seconds to wait for the MCP handshake (the local embedding model downloads on first use)
+    default: 60
+  model_cache:
+    description: Directory for the local embedding model (REVERIE_MODEL_CACHE)
+    default: ""
+  dreaming_schedule:
+    description: Cron schedule for nightly Dreaming (blank = don't install)
+    default: "0 3 * * *"

@@ -20,7 +20,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install "neo4j>=5.20,<6" pytest
+      # No runtime dependencies: the plugin reaches its graph over stdio MCP, and the tests
+      # run against tests/fake_mcp_server.py, so neither Neo4j nor the server is needed here.
+      - run: pip install pytest
       # --rootdir=tests: the repo root is itself a Python package (__init__.py), and pytest
       # cannot import it when the checkout folder has a hyphen in its name (hermes-reverie).
       - run: pytest --rootdir=tests tests
