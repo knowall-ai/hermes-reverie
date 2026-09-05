@@ -19,10 +19,10 @@ human in the morning is a pleasant by-product; the consolidation is the point.
 
 ## 1. Review the day
 
-Gather what happened since the last diary: your own Teams chats and the channels of teams you
-belong to, your own mailbox, transcripts of meetings you attended and your prep notes, work
-items you touched, and your own session history (`session_search`). Never other people's
-chats, group chats or mailboxes. Read for people, organisations, projects, decisions,
+Gather what happened since the last diary: conversations you took part in (Teams chats where you
+are a participant, channels of teams you belong to, your own mailbox), transcripts of meetings you
+attended and your prep notes, work items you touched, and your own session history
+(`session_search`). Never a conversation or mailbox you are not a participant in. Read for people, organisations, projects, decisions,
 risks, and relationships between them.
 
 ## 2. Remember, carefully
@@ -32,7 +32,8 @@ For every entity worth keeping, use the `reverie` tool:
 1. `search` first, always. Never create a second node for someone who exists under another spelling.
 2. `remember` with the canonical label (`Person`, `Organization`, `Project`, `Product`, `Concept`,
    `Meeting`, `Decision`, `Risk`, `Pet`) and properties that describe *that node only*: `role`,
-   `company`, `email`, `notes` (one or two sentences, dated), `aliases`, `verified`.
+   `email`, `notes` (one or two sentences, dated), `aliases`, `verified`. Where someone works is a
+   `WORKS_AT` edge to an `Organization` node, not a `company` property.
    **One node per thing.** A spouse, a colleague, a cat, a customer is its own node plus an edge —
    never a name inside a `notes`, `family`, `pets` or `colleagues` property, because a name in a
    property cannot be searched, connected or corrected later. If a fact names a second thing, it is
@@ -67,9 +68,15 @@ A graph of unconnected clusters is a list, not a memory. Find the islands with `
 (read-only) — organisations with no edge to your own company, people with no `WORKS_AT`, projects
 with no owner, anything whose only neighbour is itself:
 
+Run these one at a time (the `cypher` action takes a single statement):
+
 ```cypher
 MATCH (n) WHERE NOT (n)--() RETURN labels(n)[0] AS label, n.name AS name LIMIT 50
+```
+```cypher
 MATCH (o:Organization) WHERE NOT (o)-[:CUSTOMER_OF|PARTNERS_WITH|SUPPLIES]-() RETURN o.name
+```
+```cypher
 MATCH (p:Person) WHERE NOT (p)-[:WORKS_AT]->() RETURN p.name
 ```
 

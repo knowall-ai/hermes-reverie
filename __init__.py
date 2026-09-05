@@ -121,9 +121,10 @@ REVERIE_TOOL = {
         "never returned.\n"
         "• probe — everything about one entity and its relationships.\n"
         "• remember — create or update ONE entity: label + name + its own scalar properties (role, email, "
-        "company, notes). An existing entity with the same name is updated, never duplicated.\n"
+        "aliases, notes). Where someone works is a WORKS_AT edge to an Organization node, not a company property. An existing entity with the same name is updated, never duplicated.\n"
         "• connect — relate two remembered entities: from, to, type (WORKS_AT, HAS_ROLE, PARTNERS_WITH, "
-        "INTRODUCED_BY, INTERESTED_IN, MET_WITH, DISCUSSED, DECIDED, OWNS, BLOCKED_BY) and properties. "
+        "INTRODUCED_BY, INTERESTED_IN, MET_WITH, DISCUSSED, DECIDED, OWNS, BLOCKED_BY, MARRIED_TO, "
+        "CUSTOMER_OF, SUPPLIES) and properties. "
         "If a name matches more than one memory the call is refused, not guessed — say which with "
         "from_label / to_label.\n"
         "• forget — archive an entity by name (soft delete); with hard=true delete it outright. To "
@@ -139,8 +140,8 @@ REVERIE_TOOL = {
         "project, product, meeting and decision someone mentions is its own node, then connected: a "
         "spouse is a Person linked MARRIED_TO, a colleague a Person linked WORKS_AT their organisation, a "
         "cat a Pet linked OWNS from its owner, a former employee keeps the WORKS_AT edge with "
-        "status=former. Properties hold only facts about that node itself (email, role, spelling, "
-        "verified=true|false); never write another entity into a notes/pets/family/colleagues property — "
+        "status: former. Properties hold only facts about that node itself (email, role, spelling, "
+        "verified: true or false); never write another entity into a notes/pets/family/colleagues property — "
         "a name inside a property cannot be searched, connected or corrected. Test: if a fact names a "
         "second thing, it is a node and an edge, not a property. Name nodes the way a person would say "
         "them: a Meeting is 'Handover call with Sallie — 2026-09-05', never the sentence used to arrange it; "
@@ -152,7 +153,7 @@ REVERIE_TOOL = {
             "action": {"type": "string", "enum": ["search", "probe", "remember", "connect", "forget", "cypher", "stats", "dream"]},
             "query": {"type": "string", "description": "search text, or Cypher for 'cypher'"},
             "name": {"type": "string", "description": "entity name for probe/remember/forget"},
-            "label": {"type": "string", "description": "Person | Organization | Project | Product | Concept | Meeting | Decision | Risk"},
+            "label": {"type": "string", "description": "Person | Organization | Project | Product | Concept | Meeting | Decision | Risk | Pet"},
             "properties": {"type": "object", "description": "properties to set on the entity or relationship"},
             "from": {"type": "string", "description": "connect/forget: source entity name"},
             "to": {"type": "string", "description": "connect/forget: target entity name"},
