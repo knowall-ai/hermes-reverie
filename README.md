@@ -1,5 +1,7 @@
 # Reverie
 
+![Reverie — graph memory that dreams](./images/reverie-banner.png)
+
 **Graph memory that dreams.** A [Hermes Agent](https://hermes-agent.nousresearch.com) memory
 provider by [KnowAll AI](https://knowall.ai): a Neo4j knowledge graph of the people,
 organisations, projects, concepts, meetings and decisions an agent meets, recalled before every
@@ -7,9 +9,44 @@ turn, plus **Dreaming**, a nightly consolidation that reviews the day and tidies
 
 ```
 npm install -g github:knowall-ai/mcp-reverie#feat/semantic-search   # the graph server
-hermes plugins install knowall-ai/reverie
+hermes plugins install knowall-ai/hermes-reverie
 hermes memory setup reverie
 ```
+
+## Why Reverie
+
+Most agent memory is a pile of facts: a text file, a vector store, or a list of triples. Reverie is
+a **map of the entities in an agent's world and how they relate**, and it keeps that map healthy.
+
+- **A typed entity graph, not a fact store.** `Person`, `Organization`, `Project`, `Place`,
+  `Concept`, `Meeting`, `Decision` and the rest are first-class nodes with typed relationships
+  (`WORKS_AT`, `DISCUSSED`, `DECIDED`, `SPONSORS`…). Ask "Who at Atlantic Pharma have we talked to
+  about the support renewal?" and the answer is a graph walk, not a similarity search.
+- **Recall happens automatically, every turn.** The provider extracts names, emails and quoted
+  phrases from the prompt and injects the matching entities with their relationships before the
+  model answers. Nothing depends on the model remembering to call a tool.
+- **It dreams.** Each night the agent reviews the day's conversations, remembers what matters,
+  merges duplicates, fixes labels, re-embeds, looks for missing connections and writes a dream
+  diary. Bloated nodes (facts piled on as properties) are flagged so they get modelled properly.
+- **One graph, any agent.** The graph is served by [mcp-reverie](https://github.com/knowall-ai/mcp-reverie)
+  over the Model Context Protocol, so agents on other frameworks (OpenClaw, Claude Desktop, Azure
+  AI Foundry) share memory with Hermes agents. KnowAll runs an OpenClaw agent and a Hermes agent
+  against one graph this way; this plugin is the Hermes-side client of that server.
+- **Search that finds "Ben" when you say "Benjamin".** Hybrid keyword + semantic search with
+  local embeddings by default (no API key), switchable to OpenAI, Azure OpenAI, Ollama or Voyage.
+- **You can see it think.** A brain view API (in mcp-reverie) streams recalls, writes and dreams
+  live, so the [Agents Portal](https://github.com/knowall-ai/agents-portal) can draw the graph
+  lighting up.
+- **Yours to run.** Neo4j on your own box, no hosted service required, no data leaves the VM
+  unless you choose a remote embedding provider.
+
+Compared with the memory providers bundled with Hermes (Mem0, Honcho, Hindsight, Supermemory,
+OpenViking and others): those are mature and several offer hosted tiers, which Reverie does not.
+Hindsight and Mnemosyne also build graphs, but as an entity layer over facts or a generic triple
+store. None run a scheduled consolidation with hygiene reporting, share one graph across agent
+frameworks, or expose a live graph visualisation. Reverie is the right choice when the agent's
+value lies in *who* and *what* it knows and how those connect; it is not the right choice if you
+want a managed cloud memory with a track record.
 
 ## What it does
 
@@ -78,7 +115,9 @@ matching is case-insensitive. Relationship types are `UPPER_SNAKE`: `WORKS_AT`, 
 `BLOCKED_BY`. Archived nodes (`status = 'archived'`) are kept but never recalled. Property values
 are text, numbers, booleans or lists of those — anything richer belongs in its own memory. The
 same conventions are used by KnowAll's other Reverie clients, so one graph can serve several
-agents.
+agents. A property is for a durable attribute (email, role, phone); anything dated or episodic
+belongs in a relationship, its own node, or the agent's notes — the graph is a map of entities,
+not a notebook.
 
 ## Installing the server
 
@@ -152,3 +191,8 @@ stand-in MCP server that speaks the same stdio JSON-RPC and enforces the same ar
 so the client (handshake, round trip, tool errors, timeouts, crash-restart, thread safety) and
 every `graph.py` mapping are covered without Neo4j or the real server. `tests/test_terms.py` also
 holds a live round trip that runs only when `reverie` is on PATH and `NEO4J_PASSWORD` is set.
+
+## Licence
+
+MIT, © KnowAll AI Ltd. See [LICENSE](./LICENSE). Commercial support and hosted options:
+hello@knowall.ai.
