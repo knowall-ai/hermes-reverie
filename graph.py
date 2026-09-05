@@ -4,7 +4,7 @@ One small class over the official driver. Every query is parameterised; labels a
 relationship types are validated against a strict identifier pattern before they are
 interpolated, because Cypher cannot parameterise them.
 
-Graph conventions (shared with Sallie's graph so both agents can read one another's data):
+Graph conventions (shared with the MCP server so several agents can read one another's data):
 labels are capitalised singular (Person, Organization, Project, Product, Concept, Meeting,
 Decision); every node has ``name``; matching is case-insensitive on ``name`` and ``aliases``;
 relationships are UPPER_SNAKE (WORKS_AT, HAS_ROLE, PARTNERS_WITH, INTRODUCED_BY,
