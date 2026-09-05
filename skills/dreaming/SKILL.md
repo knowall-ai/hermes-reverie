@@ -1,7 +1,7 @@
 ---
 name: dreaming
 description: Nightly consolidation of the Reverie graph — review the day, remember what matters, tidy the graph, write a dream diary
-version: 0.1.0
+version: 0.2.0
 metadata:
   hermes:
     tags: [memory, reverie, consolidation]
@@ -19,9 +19,10 @@ human in the morning is a pleasant by-product; the consolidation is the point.
 
 ## 1. Review the day
 
-Gather what happened since the last diary: your Teams chats and channel messages, emails you
-sent or received, meeting transcripts and prep notes, work items you touched, and your own
-session history (`session_search`). Read for people, organisations, projects, decisions,
+Gather what happened since the last diary: your own Teams chats and the channels of teams you
+belong to, your own mailbox, transcripts of meetings you attended and your prep notes, work
+items you touched, and your own session history (`session_search`). Never other people's
+chats, group chats or mailboxes. Read for people, organisations, projects, decisions,
 risks, and relationships between them.
 
 ## 2. Remember, carefully
@@ -30,12 +31,18 @@ For every entity worth keeping, use the `reverie` tool:
 
 1. `search` first, always. Never create a second node for someone who exists under another spelling.
 2. `remember` with the canonical label (`Person`, `Organization`, `Project`, `Product`, `Concept`,
-   `Meeting`, `Decision`, `Risk`) and useful properties: `role`, `company`, `email`, `notes`
-   (one or two sentences, dated), `aliases`.
+   `Meeting`, `Decision`, `Risk`, `Pet`) and properties that describe *that node only*: `role`,
+   `company`, `email`, `notes` (one or two sentences, dated), `aliases`, `verified`.
+   **One node per thing.** A spouse, a colleague, a cat, a customer is its own node plus an edge —
+   never a name inside a `notes`, `family`, `pets` or `colleagues` property, because a name in a
+   property cannot be searched, connected or corrected later. If a fact names a second thing, it is
+   a node and an edge.
 3. `connect` with a typed relationship and a `since`/`date` property:
    works at → `WORKS_AT`; is the X of → `HAS_ROLE {role}`; partners with → `PARTNERS_WITH`;
    introduced by → `INTRODUCED_BY`; interested in → `INTERESTED_IN`; met → `MET_WITH`;
-   talked about → `DISCUSSED`; decided → `DECIDED`; owns → `OWNS`; blocked by → `BLOCKED_BY`.
+   talked about → `DISCUSSED`; decided → `DECIDED`; owns → `OWNS`; blocked by → `BLOCKED_BY`;
+   married to → `MARRIED_TO`; customer of → `CUSTOMER_OF`; supplier of → `SUPPLIES`. Someone who has
+   left keeps their `WORKS_AT` edge with `status: former` and an `until` date — do not delete history.
 4. Facts, not chat. Do not store message text, greetings, or anything the person would not
    expect you to keep. Personal details only when volunteered.
 
@@ -51,11 +58,30 @@ fixes lowercase labels, refreshes embeddings, and reports `orphans`, `duplicates
 - **bloated:** nodes carrying too many properties. Fold their dated facts into a short
   attribute, a relationship, or your notes.
 
-## 4. Find connections
+## 4. Join the islands
 
-Ask the graph a few questions with `cypher` (read-only): who did we meet this month with no
-follow-up? Which projects have a `BLOCKED_BY` with no `DECIDED`? Which people appear in two
-organisations? Note anything surprising.
+A graph of unconnected clusters is a list, not a memory. Find the islands with `cypher`
+(read-only) — organisations with no edge to your own company, people with no `WORKS_AT`, projects
+with no owner, anything whose only neighbour is itself:
+
+```cypher
+MATCH (n) WHERE NOT (n)--() RETURN labels(n)[0] AS label, n.name AS name LIMIT 50
+MATCH (o:Organization) WHERE NOT (o)-[:CUSTOMER_OF|PARTNERS_WITH|SUPPLIES]-() RETURN o.name
+MATCH (p:Person) WHERE NOT (p)-[:WORKS_AT]->() RETURN p.name
+```
+
+Then be investigative about each one before you `connect` it: your session history and saved
+call transcripts say how it came up; the Microsoft Graph directory gives full names, emails and
+managers (`graph.mjs` user lookup); work items and calendars say which project or customer it
+belongs to; and a sibling agent who knows the account can simply be asked — Sallie runs on
+OpenClaw with her own Neo4j graph, so ask her in Teams rather than expecting the same tools. Record
+what you found as a typed edge with a `source` property ("Ben, call 2026-09-05" / "Graph directory"),
+and only mark a node `verified: true` when a directory or a person confirmed it. A guess stays a
+guess: put it in the diary under **Tomorrow**, not in the graph.
+
+Then ask the graph a few questions: who did we meet this month with no follow-up? Which projects
+have a `BLOCKED_BY` with no `DECIDED`? Which people appear in two organisations? Note anything
+surprising.
 
 ## 5. Dream diary
 

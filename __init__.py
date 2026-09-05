@@ -120,8 +120,8 @@ REVERIE_TOOL = {
         "'who else is like this', a higher threshold for fewer, closer matches. Archived memories are "
         "never returned.\n"
         "• probe — everything about one entity and its relationships.\n"
-        "• remember — create or update an entity: label + name + properties (role, email, company, notes). "
-        "An existing entity with the same name is updated, never duplicated.\n"
+        "• remember — create or update ONE entity: label + name + its own scalar properties (role, email, "
+        "company, notes). An existing entity with the same name is updated, never duplicated.\n"
         "• connect — relate two remembered entities: from, to, type (WORKS_AT, HAS_ROLE, PARTNERS_WITH, "
         "INTRODUCED_BY, INTERESTED_IN, MET_WITH, DISCUSSED, DECIDED, OWNS, BLOCKED_BY) and properties. "
         "If a name matches more than one memory the call is refused, not guessed — say which with "
@@ -134,7 +134,15 @@ REVERIE_TOOL = {
         "• dream — run graph hygiene (merge duplicates, fix labels, refresh embeddings, report bloated "
         "nodes); dry_run=true reports without writing.\n\n"
         "Search before you remember: never create a person or organisation that already exists under "
-        "another spelling. Labels are capitalised singular. Store facts, not chat."
+        "another spelling. Labels are capitalised singular. Store facts, not chat.\n\n"
+        "GRAPH SHAPE — one node per thing, one edge per relationship. Every person, pet, organisation, "
+        "project, product, meeting and decision someone mentions is its own node, then connected: a "
+        "spouse is a Person linked MARRIED_TO, a colleague a Person linked WORKS_AT their organisation, a "
+        "cat a Pet linked OWNS from its owner, a former employee keeps the WORKS_AT edge with "
+        "status=former. Properties hold only facts about that node itself (email, role, spelling, "
+        "verified=true|false); never write another entity into a notes/pets/family/colleagues property — "
+        "a name inside a property cannot be searched, connected or corrected. Test: if a fact names a "
+        "second thing, it is a node and an edge, not a property."
     ),
     "parameters": {
         "type": "object",
@@ -300,8 +308,10 @@ class ReverieMemoryProvider(MemoryProvider):
             "# Reverie\n" + head + "\n"
             "Relevant entities are recalled automatically before each turn under '## Reverie recalls'. "
             "Use the reverie tool to probe deeper, and to remember/connect facts worth keeping: who works where, "
-            "who decided what, which project is blocked by whom. Search before creating. Labels: "
-            + ", ".join(CANONICAL_LABELS) + "."
+            "who decided what, which project is blocked by whom. Remember as soon as you hear a durable fact, "
+            "not at the end. One node per person/pet/organisation/project and one edge per relationship — "
+            "never a list of names inside a property. Search before creating. Labels: "
+            + ", ".join(CANONICAL_LABELS) + " (Pet is accepted too)."
         )
 
     # -- recall ------------------------------------------------------------
