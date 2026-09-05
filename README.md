@@ -76,7 +76,7 @@ docker run -d --name neo4j --restart unless-stopped \
 
 ```
 pip install neo4j pytest
-pytest tests
+pytest --rootdir=tests tests   # --rootdir: the repo root is itself a package, and a hyphenated folder name breaks collection
 ```
 
 `tests/test_terms.py` covers the recall-term extraction; graph tests need a live Neo4j and are

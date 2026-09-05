@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install "neo4j>=5.20,<6" pytest
+      # --rootdir=tests: the repo root is itself a Python package (__init__.py), and pytest
+      # cannot import it when the checkout folder has a hyphen in its name (hermes-reverie).
+      - run: pytest --rootdir=tests tests
