@@ -49,7 +49,7 @@ def test_recall_maps_to_search_memories_with_one_call():
     assert tool == "search_memories"
     assert args["query"] == "Ava Walsh ava@atlanticpharma.example"
     assert args["search_mode"] == "hybrid" and args["similarity_threshold"] == 0.55
-    assert args["depth"] == 2 and args["limit"] == 10  # asks for 2x the limit, then filters
+    assert args["depth"] == 2 and args["limit"] == 5  # exactly the limit: the server hides archived nodes
 
     assert hits[0]["label"] == "Person"
     assert hits[0]["props"] == {"name": "Ava Walsh", "role": "CEO"}  # _-prefixed metadata stripped
@@ -64,18 +64,20 @@ def test_recall_without_terms_calls_nothing():
     assert client.calls == []
 
 
-def test_recall_drops_archived_and_honours_the_limit():
-    rows = [{"memory": memory(i, "Person", name=f"P{i}", **({"status": "archived"} if i % 2 else {})),
-             "connections": []} for i in range(1, 7)]
-    graph = Graph(RecordingClient([rows]))
-    hits = graph.recall(["p"], limit=2)
-    assert [h["props"]["name"] for h in hits] == ["P2", "P4"]
+def test_recall_asks_for_exactly_the_limit_and_does_not_filter_again():
+    """The server drops archived nodes, so there is nothing left to over-fetch for."""
+    rows = [{"memory": memory(i, "Person", name=f"P{i}"), "connections": []} for i in range(1, 7)]
+    client = RecordingClient([rows])
+    hits = Graph(client).recall(["p"], limit=2)
+    assert client.calls[0][1]["limit"] == 2
+    assert "include_archived" not in client.calls[0][1], "the default is what recall wants"
+    assert [h["props"]["name"] for h in hits] == ["P1", "P2"]
 
 
 def test_probe_is_a_recall_of_three():
     client = RecordingClient([[]])
     Graph(client).probe(" Atlantic ")
-    assert client.calls[0][1]["query"] == "Atlantic" and client.calls[0][1]["limit"] == 6
+    assert client.calls[0][1]["query"] == "Atlantic" and client.calls[0][1]["limit"] == 3
 
 
 def test_remember_creates_when_nothing_matches():
@@ -84,7 +86,7 @@ def test_remember_creates_when_nothing_matches():
 
     lookup, create = client.calls
     assert lookup[0] == "search_memories"
-    assert lookup[1]["search_mode"] == "keyword" and lookup[1]["depth"] == 0
+    assert lookup[1]["search_mode"] == "exact" and lookup[1]["depth"] == 0
     assert create == ("create_memory", {"label": "Person", "properties": {"name": "Ada Lovelace", "role": "analyst"}})
     assert node == {"id": 7, "label": "Person", "props": {"name": "Ada Lovelace", "role": "analyst"}}
 
@@ -359,7 +361,7 @@ def test_search_sends_only_keys_the_server_allows():
     client = RecordingClient([[]])
     Graph(client).search_memories("x", limit=5)
     allowed = {"query", "label", "depth", "order_by", "limit", "since_date", "search_mode",
-               "similarity_threshold"}
+               "similarity_threshold", "include_archived"}
     assert set(client.calls[0][1]) <= allowed
 
 
@@ -462,38 +464,88 @@ def named(node_id, label, name):
     return {"memory": memory(node_id, label, name=name), "connections": []}
 
 
-def test_name_lookup_asks_for_the_whole_page_so_a_common_name_cannot_crowd_it_out():
-    """A keyword search for "James" can match hundreds of nodes; the real one must be in the page."""
+def test_the_name_lookup_asks_the_server_for_an_exact_match():
+    """Matching is the server's job now: exact mode, the whole page, no neighbours."""
     client = RecordingClient([[]])
     Graph(client).find("James Kelly", label="Person")
     tool, args = client.calls[0]
     assert tool == "search_memories"
-    assert args["limit"] == 200, "the server's maximum, until search_mode 'exact' exists"
-    assert args["depth"] == 0 and args["search_mode"] == "keyword"
+    assert args["search_mode"] == "exact", "the server matches the name, not the client"
+    assert args["limit"] == 200, "the server's maximum, so every duplicate of the name is on the page"
+    assert args["depth"] == 0
     assert args["label"] == "Person", "the label is pushed down so the page holds only candidates"
 
 
-def test_the_name_lookup_has_one_switch_point_for_the_future_exact_mode():
+def test_the_name_lookup_has_one_switch_point():
     assert set(graph_module.NAME_SEARCH) == {"search_mode", "limit", "depth"}
+    assert graph_module.NAME_SEARCH["search_mode"] == "exact"
     assert graph_module.NAME_SEARCH["search_mode"] in graph_module.SEARCH_MODES
 
 
-def test_find_all_returns_every_exact_match_and_ignores_near_ones():
-    rows = [named(1, "Person", "James Kelly"), named(2, "Person", "James Kelly Jr"),
-            named(3, "Organization", "james kelly"), named(4, "Person", "James Kelly")]
-    matches = Graph(RecordingClient([rows])).find_all("james kelly")
-    assert [m["id"] for m in matches] == [1, 3, 4]
+def test_find_all_takes_the_servers_answer_as_it_stands():
+    """No second pass in the client: what exact mode returned is what find_all returns."""
+    rows = [named(1, "Person", "James Kelly"), named(4, "Person", "James Kelly")]
+    assert [m["id"] for m in Graph(RecordingClient([rows])).find_all("james kelly")] == [1, 4]
 
 
-def test_find_all_filters_by_label():
-    rows = [named(1, "Person", "Atlas"), named(2, "Project", "Atlas")]
-    assert [m["id"] for m in Graph(RecordingClient([rows])).find_all("Atlas", label="Project")] == [2]
+def test_exact_mode_finds_the_one_node_among_common_names(graph):
+    """A keyword search for "James Kelly" would return all three; the lookup must not."""
+    for name in ("James Kelly", "James Kelly Jr", "James Kellynch"):
+        graph.remember("Person", name)
+    assert [m["props"]["name"] for m in graph.find_all("james kelly")] == ["James Kelly"]
+    assert graph.resolve("JAMES KELLY")["props"]["name"] == "James Kelly"
 
 
-def test_find_all_skips_archived():
-    rows = [{"memory": memory(1, "Person", name="Ada", status="archived"), "connections": []},
-            named(2, "Person", "Ada")]
-    assert [m["id"] for m in Graph(RecordingClient([rows])).find_all("Ada")] == [2]
+def test_exact_mode_matches_an_alias_or_an_email(graph):
+    graph.remember("Person", "Benjamin Weeks", {"email": "ben@knowall.example", "aliases": ["Ben Weeks"]})
+    assert graph.find("Ben Weeks")["props"]["name"] == "Benjamin Weeks"
+    assert graph.find("BEN@KNOWALL.EXAMPLE")["props"]["name"] == "Benjamin Weeks"
+
+
+def test_find_all_pushes_the_label_down_to_the_server(graph):
+    for label in ("Person", "Project"):
+        graph.remember(label, "Atlas")
+    assert [m["label"] for m in graph.find_all("Atlas", label="Project")] == ["Project"]
+    assert len(graph.find_all("Atlas")) == 2
+
+
+def test_an_archived_node_is_no_longer_found_by_name(graph):
+    graph.remember("Person", "Ada Lovelace")
+    assert graph.forget("Ada Lovelace") == 1
+    assert graph.find_all("Ada Lovelace") == []
+    assert graph.search_memories("Ada Lovelace", search_mode="exact", include_archived=True)
+
+
+def test_archived_nodes_vanish_from_recall_and_from_connections(graph):
+    graph.remember("Person", "Ava Walsh")
+    graph.remember("Organization", "Atlantic Pharma")
+    graph.remember("Project", "Atlantic Rollout")
+    graph.connect("Ava Walsh", "Atlantic Pharma", "WORKS_AT")
+    graph.connect("Ava Walsh", "Atlantic Rollout", "OWNS")
+    assert graph.forget("Atlantic Pharma") == 1
+
+    hits = graph.recall(["Atlantic"], limit=10)
+    assert [h["props"]["name"] for h in hits] == ["Atlantic Rollout"], "the archived node is gone"
+    ava = graph.recall(["Ava Walsh"], limit=10)[0]
+    assert [r["name"] for r in ava["rels"]] == ["Atlantic Rollout"], "and gone from the neighbourhood"
+
+
+def test_include_archived_brings_them_back(graph):
+    graph.remember("Person", "Ava Walsh")
+    graph.remember("Organization", "Atlantic Pharma")
+    graph.connect("Ava Walsh", "Atlantic Pharma", "WORKS_AT")
+    graph.forget("Atlantic Pharma")
+
+    rows = graph.search_memories("Atlantic Pharma", search_mode="exact", include_archived=True)
+    assert rows[0]["memory"]["status"] == "archived"
+    with_archived = graph.search_memories("Ava Walsh", search_mode="exact", depth=1, include_archived=True)
+    assert [c["memory"]["name"] for c in with_archived[0]["connections"]] == ["Atlantic Pharma"]
+
+
+@pytest.mark.parametrize("bad", ["true", 1, "", []])
+def test_include_archived_must_be_a_boolean(bad):
+    with pytest.raises(ValueError, match="include_archived"):
+        Graph(RecordingClient([[]])).search_memories("x", include_archived=bad)
 
 
 def test_resolve_refuses_an_ambiguous_name():
@@ -510,8 +562,10 @@ def test_resolve_names_the_labels_it_could_not_choose_between():
 
 
 def test_resolve_accepts_a_label_to_break_the_tie():
-    rows = [named(1, "Person", "Atlas"), named(2, "Project", "Atlas")]
-    assert Graph(RecordingClient([rows, rows])).resolve("Atlas", "Project")["id"] == 2
+    """The label is pushed down, so the server answers with the one candidate."""
+    client = RecordingClient([[named(2, "Project", "Atlas")]])
+    assert Graph(client).resolve("Atlas", "Project")["id"] == 2
+    assert client.calls[0][1]["label"] == "Project"
 
 
 def test_connect_refuses_an_ambiguous_end_rather_than_guessing():
@@ -524,9 +578,9 @@ def test_connect_refuses_an_ambiguous_end_rather_than_guessing():
 
 
 def test_connect_takes_labels_for_both_ends():
-    ambiguous = [named(1, "Person", "Atlas"), named(2, "Project", "Atlas")]
-    orgs = [named(3, "Person", "KnowAll"), named(4, "Organization", "KnowAll")]
-    client = RecordingClient([ambiguous, orgs, {"relationship": {"_id": 9, "_type": "OWNS"}}])
+    # The labels are pushed down, so each lookup comes back with one candidate.
+    client = RecordingClient([[named(2, "Project", "Atlas")], [named(4, "Organization", "KnowAll")],
+                              {"relationship": {"_id": 9, "_type": "OWNS"}}])
     result = Graph(client).connect("Atlas", "KnowAll", "OWNS",
                                    from_label="Project", to_label="Organization")
     assert client.calls[0][1]["label"] == "Project" and client.calls[1][1]["label"] == "Organization"
@@ -547,9 +601,8 @@ def test_forget_connection_is_a_no_op_when_an_end_is_unknown():
 
 
 def test_forget_connection_takes_labels():
-    ambiguous = [named(1, "Person", "Atlas"), named(2, "Project", "Atlas")]
-    orgs = [named(4, "Organization", "KnowAll")]
-    client = RecordingClient([ambiguous, orgs, {"deletedCount": 1}])
+    client = RecordingClient([[named(2, "Project", "Atlas")], [named(4, "Organization", "KnowAll")],
+                              {"deletedCount": 1}])
     assert Graph(client).forget_connection("Atlas", "KnowAll", "owns", from_label="Project") == 1
     assert client.calls[2] == ("delete_connection",
                                {"fromMemoryId": 2, "toMemoryId": 4, "type": "OWNS"})
