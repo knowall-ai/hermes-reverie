@@ -144,7 +144,7 @@ REVERIE_TOOL = {
         "verified: true or false); never write another entity into a notes/pets/family/colleagues property — "
         "a name inside a property cannot be searched, connected or corrected. Test: if a fact names a "
         "second thing, it is a node and an edge, not a property. Name nodes the way a person would say "
-        "them: a Meeting is 'Handover call with Sallie — 2026-09-05', never the sentence used to arrange it; "
+        "them: a Meeting is 'Kick-off call with Acme — 2026-09-05', never the sentence used to arrange it; "
         "purpose and outcome go in a summary property."
     ),
     "parameters": {

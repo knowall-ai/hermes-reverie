@@ -38,7 +38,7 @@ For every entity worth keeping, use the `reverie` tool:
    never a name inside a `notes`, `family`, `pets` or `colleagues` property, because a name in a
    property cannot be searched, connected or corrected later. If a fact names a second thing, it is
    a node and an edge.
-   **Name nodes the way a person would say them.** A `Meeting` is "Handover call with Sallie —
+   **Name nodes the way a person would say them.** A `Meeting` is "Kick-off call with Acme —
    2026-09-05", not the sentence that was used to arrange it; the purpose, agenda and outcome go in
    `summary`. A `Project` is its short working name; an `Organization` is its trading name.
 3. `connect` with a typed relationship and a `since`/`date` property:
