@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 #: Mirrors the server's IDENTIFIER_RE (mcp-reverie src/types.ts, contract 01dceae): labels and
 #: relationship types are interpolated into Cypher, so they must be plain identifiers.
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
-CANONICAL_LABELS = ("Person", "Organization", "Project", "Product", "Concept", "Meeting", "Decision", "Risk")
+CANONICAL_LABELS = ("Person", "Organization", "Project", "Product", "Concept", "Meeting", "Decision", "Risk", "Pet")
 #: Mirrors the server's read-only guard (src/cypher-guard.ts).
 WRITE_RE = re.compile(r"\b(CREATE|MERGE|SET|DELETE|REMOVE|DROP|DETACH|FOREACH|LOAD\s+CSV)\b", re.IGNORECASE)
 CALL_RE = re.compile(r"\bCALL\b", re.IGNORECASE)
