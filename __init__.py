@@ -113,7 +113,7 @@ REVERIE_TOOL = {
         "Reverie: your knowledge graph of people, organisations, projects, products, concepts, "
         "meetings and decisions. Recall happens automatically before each turn; use this tool to "
         "look deeper or to write.\n\nACTIONS:\n"
-        "• search — hybrid keyword + semantic search, so 'Ben Weeks' also finds 'Benjamin Weeks'. "
+        "• search — hybrid keyword + semantic search, so 'Sam Taylor' also finds 'Samantha Taylor'. "
         "Optional search_mode (hybrid | keyword | semantic | exact) and similarity_threshold (0-1, "
         "default 0.4) tune it: exact to ask whether one name is already in the graph (it matches only a "
         "memory whose name, alias or email equals the query), keyword for a literal word, semantic for "
