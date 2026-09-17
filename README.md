@@ -1,5 +1,7 @@
 # Reverie
 
+[![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/knowall-ai/hermes-reverie?label=CodeRabbit+Reviews&labelColor=171717&color=FF570A)](https://coderabbit.ai)
+
 ![Reverie — graph memory that dreams](./images/reverie-banner.png)
 
 **Graph memory that dreams.** A [Hermes Agent](https://hermes-agent.nousresearch.com) memory
