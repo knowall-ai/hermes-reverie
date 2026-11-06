@@ -10,7 +10,7 @@ organisations, projects, concepts, meetings and decisions an agent meets, recall
 turn, plus **Dreaming**, a nightly consolidation that reviews the day and tidies the graph.
 
 ```
-npm install -g github:knowall-ai/mcp-reverie   # the graph server, 0.4.x or newer
+npm install -g @knowall-ai/reverie@^0.5.4      # the graph server, 0.5.4 or newer
 hermes plugins install knowall-ai/hermes-reverie
 hermes memory setup reverie
 ```
@@ -53,9 +53,14 @@ want a managed cloud memory with a track record.
 ## What it does
 
 - **Recall.** Before each non-trivial turn, names, emails and quoted phrases in the prompt are
-  matched against the graph — hybrid keyword **and** semantic search, so "Ben Weeks" also finds
-  "Benjamin Weeks" — and the hits are injected with their relationships:
+  matched against the graph — hybrid keyword, semantic **and** fuzzy name search, so "Ben Weeks"
+  also finds "Benjamin Weeks" and a misheard "Stephen Grimason" finds "Steven Grimason" — and the
+  hits are injected with their relationships:
   `Person Ava Walsh (CEO, Atlantic Pharma) — WORKS_AT Atlantic Pharma; DISCUSSED support renewal`.
+  Each term is searched on its own, hits scoring below `recall_min_score` are dropped, and the
+  `recall_limit` slots are dealt round-robin across the terms (emails and multi-word names first),
+  so a sentence-initial "What" cannot fill the page with weak matches. When recall misses a name,
+  the agent is told to search for it itself (surname, `search_mode: "fuzzy"`).
 - **Remember.** The agent writes through one tool, `reverie`, with `search`, `probe`, `remember`,
   `connect`, `forget`, `cypher` (read-only), `stats` and `dream`. The graph only ever holds curated
   entities, never raw chat.
@@ -79,7 +84,7 @@ Hermes ──▶ ReverieMemoryProvider (__init__.py)
 
 | Reverie verb | MCP tool |
 | --- | --- |
-| `search` / recall, `probe` | `search_memories` (hybrid by default; `search_mode`, `similarity_threshold`, `depth`, `limit`) |
+| `search` / recall, `probe` | `search_memories` (hybrid by default; `search_mode`, `similarity_threshold`, `depth`, `limit`); recall makes one call per term. Results carry `score` (0-1), `match` (`exact`, `keyword`, `semantic`, `fuzzy`) and, for fuzzy hits, `matched` |
 | `remember` | `search_memories` with `search_mode: "exact"` (dedupe) then `create_memory` or `update_memory` |
 | `connect` | `search_memories` ×2 (`search_mode: "exact"`) to resolve names (`from_label`/`to_label` when a name is ambiguous), then `create_connection` |
 | `forget` | `update_memory` (`status = 'archived'`) for a `name`, `delete_memory` with `hard`, or `delete_connection` given `from` + `to` + `type` together |
@@ -97,7 +102,14 @@ The plugin validates labels, relationship types, node ids, properties and search
 against the server's contract before calling, so a bad call comes back as a readable error
 instead of a rejected tool call.
 
-**Minimum server: mcp-reverie `95baf2a` (0.4.x) or newer.** The plugin is a thin client and
+**Minimum server: mcp-reverie 0.5.4 or newer.** 0.5.4 is the first release with fuzzy name
+matching ([mcp-reverie #34](https://github.com/knowall-ai/mcp-reverie/pull/34)) and the first that
+reports its real version: builds before it all said `0.5.0` in `serverInfo`. The plugin reads that
+version at start-up and logs a warning (it still runs) when the server is older. Against 0.4.x-0.5.3
+recall still works, but misspelled names are missed and `search_mode: "fuzzy"` is rejected. A server
+that returns no `_score` keeps every hit (no `recall_min_score`), with one warning.
+
+The plugin is a thin client and
 leans on two things that landed in [mcp-reverie #20](https://github.com/knowall-ai/mcp-reverie/pull/20):
 `search_memories` accepts `search_mode: "exact"` (case-insensitive equality on `name`, an alias
 or `email`), and archived memories are excluded from results *and* from the connections
@@ -135,18 +147,16 @@ not a notebook.
 
 ## Installing the server
 
-Until `@knowall-ai/reverie` is published, install it from GitHub:
-
 ```
-npm install -g github:knowall-ai/mcp-reverie   # today
-npm install -g @knowall-ai/reverie            # once published to npm
+npm install -g @knowall-ai/reverie@^0.5.4               # from npm
+npm install -g github:knowall-ai/mcp-reverie#v0.5.4     # or a tagged GitHub build
 which reverie   # must be on PATH for the plugin to report itself available
 ```
 
 Requires Node 18+ and **Neo4j 5.9 or newer** (`dream` uses `COUNT {}` and `IS :: STRING`), with
-APOC for duplicate merging. The server must be **mcp-reverie `95baf2a` (0.4.x) or newer**: the
-plugin's name lookups use `search_mode: "exact"` and rely on the server hiding archived
-memories. An older server rejects the search argument and shows archived nodes in recall.
+APOC for duplicate merging. The server must be **mcp-reverie 0.5.4 or newer** (see
+[Minimum server](#how-it-talks-to-the-graph)); 0.4.x is the hard floor, below which name lookups
+fail and archived nodes reappear in recall.
 
 ## Configuration
 
@@ -172,7 +182,8 @@ plugins:
     embeddings: local             # local | openai | azure | ollama | voyage | none
     search_mode: hybrid           # hybrid | keyword | semantic (the recall default)
     similarity_threshold: ""      # blank = the server's default (0.4)
-    recall_limit: 5
+    recall_limit: 5               # entities per turn, shared round-robin across the prompt's terms
+    recall_min_score: 0.5         # drop recalled hits scoring below this (0-1)
     recall_depth: 1               # relationship hops recalled with each entity, 0-5
     server_timeout: 30            # seconds per tool call
     server_startup_timeout: 60    # the local embedding model downloads on first use
@@ -182,6 +193,16 @@ plugins:
 Other server-side knobs, set in `.env`: `REVERIE_EMBEDDING_MODEL`, `REVERIE_EMBED_TIMEOUT_MS`
 (default 30000, max 120000), `REVERIE_LAZY_EMBED_BATCH` (default 100), `REVERIE_MAX_PROPERTIES`
 (default 30 — above this, `dream` reports a node as bloated and `update_memory` returns a hint).
+
+**`recall_min_score` (default 0.5).** Every search hit carries the server's score: exact = 1,
+keyword = the share of the query's words found, semantic = cosine similarity, fuzzy = name
+similarity (at least 0.85). Measured with the default local model (all-MiniLM-L6-v2), a lone
+common word ("What", "Who", "Hello") scores 0.13-0.39 against unrelated people and projects, while
+the names recall is for score 0.5 (one word of a two-word name, as a keyword), 0.57-0.92
+semantically ("Valeria" → "Valeriia", "Stephen Grimason" → "Steven Grimason") and 0.85-1 as fuzzy,
+keyword or exact hits. Raise it for a quieter recall; with a different embedding model, re-check
+where its unrelated matches sit. The agent's own `search` is never filtered: it sees every hit
+with its score.
 
 ## Running Neo4j
 
@@ -204,8 +225,14 @@ pytest --rootdir=tests tests   # --rootdir: the repo root is itself a package, a
 No runtime dependencies and nothing to install beyond pytest: `tests/fake_mcp_server.py` is a
 stand-in MCP server that speaks the same stdio JSON-RPC and enforces the same argument contract,
 so the client (handshake, round trip, tool errors, timeouts, crash-restart, thread safety) and
-every `graph.py` mapping are covered without Neo4j or the real server. `tests/test_terms.py` also
-holds a live round trip that runs only when `reverie` is on PATH and `NEO4J_PASSWORD` is set.
+every `graph.py` mapping are covered without Neo4j or the real server. `tests/test_recall.py`
+covers scored, fair recall, including the "What do we know about Stephen Grimason?" regression.
+`tests/test_terms.py` also holds live tests (a round trip, and a misheard name recalled by fuzzy
+matching) that run only when `reverie` is on PATH and `NEO4J_PASSWORD` is set.
+
+Versioning: `plugin.yaml`'s `version` is the plugin's release number, independent of the server's.
+CI fails a pull request that changes the plugin's code (anything outside `tests/`, `images/` and
+the docs) without changing it.
 
 ## Licence
 

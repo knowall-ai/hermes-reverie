@@ -46,13 +46,25 @@ READ_ONLY_PROCEDURES = frozenset({
 })
 
 DEFAULT_SERVER_COMMAND = "reverie"
-#: Search modes the server accepts (mcp-reverie ``src/search.ts`` @ 95baf2a). ``exact`` is
-#: case-insensitive equality on ``name``, ``aliases`` or ``email`` — a lookup, not a ranking.
-SEARCH_MODES = ("hybrid", "keyword", "semantic", "exact")
+#: Search modes the server accepts (mcp-reverie ``src/search.ts``). ``exact`` is case-insensitive
+#: equality on ``name``, ``aliases`` or ``email`` — a lookup, not a ranking. ``fuzzy`` (0.5.4+) is
+#: spelling- and sound-alike name matching: "Stephen Grimason" finds "Steven Grimason".
+SEARCH_MODES = ("hybrid", "keyword", "semantic", "exact", "fuzzy")
 #: The modes that make sense as the *recall* default: exact belongs to name lookups, not to
 #: reading a prompt, so it is not offered as a configured default.
 RECALL_MODES = ("hybrid", "keyword", "semantic")
 SEARCH_MAX_LIMIT = 200
+#: The oldest mcp-reverie this plugin is written for: 0.5.4 is the first release that ships fuzzy name
+#: matching (mcp-reverie #34) and reports its real version in ``serverInfo`` (earlier builds all said 0.5.0).
+MIN_SERVER_VERSION = "0.5.4"
+#: Automatic recall keeps a hit only when its relevance score reaches this. Every hit carries the
+#: server's ``_score`` (0-1): exact = 1, keyword = share of the query's words found, semantic = cosine
+#: similarity, fuzzy = name similarity (at least 0.85). Measured with the default local model
+#: (all-MiniLM-L6-v2): a lone common word ("What", "Who", "Hello") scores 0.13-0.39 semantically against
+#: unrelated people and projects, while the names it should find score 0.5 (half of a two-word name as a
+#: keyword: "Grimason" in "Stephen Grimason"), 0.57-0.92 semantically ("Valeria" → "Valeriia",
+#: "Stephen Grimason" → "Steven Grimason") and 0.85-1 as fuzzy, keyword or exact hits. 0.5 sits between.
+DEFAULT_RECALL_MIN_SCORE = 0.5
 SEARCH_MAX_DEPTH = 5
 #: Embedding providers the server accepts in REVERIE_EMBEDDINGS.
 EMBEDDING_PROVIDERS = ("local", "openai", "azure", "ollama", "voyage", "none")
@@ -130,16 +142,41 @@ def _int_in_range(value: Any, low: int, high: int, what: str) -> int:
     return max(low, min(high, number))
 
 
-def _threshold(value: Any) -> Optional[float]:
+def _threshold(value: Any, what: str = "similarity_threshold") -> Optional[float]:
     if value is None or value == "":
         return None
     try:
         number = float(value)
     except (TypeError, ValueError):
-        raise ValueError(f"invalid similarity_threshold: {value!r} — must be a number in 0..1") from None
+        raise ValueError(f"invalid {what}: {value!r} — must be a number in 0..1") from None
     if number != number or number in (float("inf"), float("-inf")) or not 0.0 <= number <= 1.0:
-        raise ValueError(f"invalid similarity_threshold: {value!r} — must be a finite number in 0..1")
+        raise ValueError(f"invalid {what}: {value!r} — must be a finite number in 0..1")
     return number
+
+
+def version_tuple(version: Any) -> Optional[tuple]:
+    """``"0.5.4"`` → ``(0, 5, 4)``; None for anything that is not a dotted release number."""
+    match = re.match(r"^\s*v?(\d+)\.(\d+)\.(\d+)", str(version or ""))
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def server_version_warning(server_info: Dict[str, Any]) -> Optional[str]:
+    """Why this server is older than the plugin expects, or None when it is new enough."""
+    version = (server_info or {}).get("version")
+    have = version_tuple(version)
+    if have is None:
+        return (f"Reverie: the mcp-reverie server did not report a version ({version!r}); this plugin "
+                f"needs {MIN_SERVER_VERSION} or newer for fuzzy name matching")
+    if have < version_tuple(MIN_SERVER_VERSION):
+        return (f"Reverie: mcp-reverie {version} is older than {MIN_SERVER_VERSION}; misspelled or misheard "
+                "names will not be found (no fuzzy matching). Upgrade the server: "
+                f"npm install -g @knowall-ai/reverie@{MIN_SERVER_VERSION}")
+    return None
+
+
+def _priority(term: str) -> int:
+    """Recall order: emails and multi-word names before single words, which are most often noise."""
+    return 0 if "@" in term or len(term.split()) > 1 else 1
 
 
 def read_only_violation(cypher: str) -> Optional[str]:
@@ -195,6 +232,8 @@ class Graph:
         search_mode: default mode for recall (``hybrid``, ``keyword`` or ``semantic``).
         similarity_threshold: semantic cut-off passed to the server (it defaults to 0.4).
         depth: relationship depth included with each recalled entity (0-5).
+        min_score: automatic recall drops hits scoring below this (0-1, default
+            :data:`DEFAULT_RECALL_MIN_SCORE`); explicit searches return everything, with scores.
 
     Archived memories (``status = 'archived'``) are excluded by the server, from results and from
     the neighbourhoods it returns with them; nothing here filters them again. No verb needs them
@@ -208,8 +247,11 @@ class Graph:
         search_mode: str = "hybrid",
         similarity_threshold: Optional[float] = None,
         depth: int = 1,
+        min_score: Optional[float] = DEFAULT_RECALL_MIN_SCORE,
     ) -> None:
         self.client = client
+        self.min_score = DEFAULT_RECALL_MIN_SCORE if min_score is None else _threshold(min_score, "recall_min_score")
+        self._warned_unscored = False
         if search_mode not in RECALL_MODES:
             raise ValueError(f"invalid search_mode: {search_mode!r} — one of {', '.join(RECALL_MODES)}")
         self.search_mode = search_mode
@@ -222,7 +264,7 @@ class Graph:
 
         Config keys (all optional): ``server_command``, ``server_timeout``,
         ``server_startup_timeout``, ``embeddings``, ``model_cache``, ``search_mode``,
-        ``similarity_threshold``, ``recall_depth``.
+        ``similarity_threshold``, ``recall_depth``, ``recall_min_score``.
         """
         config = config or {}
         extra_env: Dict[str, Any] = {}
@@ -249,6 +291,7 @@ class Graph:
             search_mode=mode,
             similarity_threshold=_threshold(config.get("similarity_threshold")),
             depth=_int_in_range(config.get("recall_depth", 1), 0, SEARCH_MAX_DEPTH, "recall_depth"),
+            min_score=_threshold(config.get("recall_min_score"), "recall_min_score"),
         )
 
     def close(self) -> None:
@@ -259,6 +302,11 @@ class Graph:
 
     def ping(self) -> bool:
         return self.client.ping()
+
+    def server_info(self) -> Dict[str, Any]:
+        """The server's MCP ``serverInfo`` (name, version) from the last handshake; empty before one."""
+        info = getattr(self.client, "server_info", None)
+        return dict(info) if isinstance(info, dict) else {}
 
     # -- low level ---------------------------------------------------------
     def call(self, tool: str, **arguments: Any) -> Any:
@@ -311,29 +359,25 @@ class Graph:
         )
         return rows if isinstance(rows, list) else []
 
-    def recall(
+    def search(
         self,
-        terms: Iterable[str],
-        limit: int = 5,
+        query: str,
+        limit: int = 10,
         label: Optional[str] = None,
         depth: Optional[int] = None,
         search_mode: Optional[str] = None,
         similarity_threshold: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """Entities matching any of ``terms``, with their neighbours.
+        """Hits for one query, best first, each with the server's ``score``/``match``/``matched``.
 
-        The terms are joined into one query: the server's keyword pass matches a node when any
-        word of the query appears in any of its content properties, which is the OR the old
-        Cypher did, in a single round trip. In hybrid mode the semantic pass then adds close
-        variants ("Ben Weeks" finding "Benjamin Weeks") that keywords miss. Archived nodes never
-        come back — the server excludes them, from the hits and from their neighbourhoods — so the
-        page asked for is the page used.
+        Nothing is filtered by score: this is the agent's own search, and it gets to judge. Archived
+        nodes never come back — the server excludes them, from the hits and from their neighbourhoods.
         """
-        terms = [str(t).strip() for t in terms if t and str(t).strip()]
-        if not terms:
+        query = str(query or "").strip()
+        if not query:
             return []
         rows = self.search_memories(
-            " ".join(terms),
+            query,
             limit=_int_in_range(limit, 1, SEARCH_MAX_LIMIT, "limit"),
             label=label,
             depth=depth,
@@ -347,13 +391,65 @@ class Graph:
                 continue
             seen.add(hit["id"])
             hits.append(hit)
-            if len(hits) >= int(limit):
-                break
+        return hits[:int(limit)]
+
+    def recall(
+        self,
+        terms: Iterable[str],
+        limit: int = 5,
+        label: Optional[str] = None,
+        depth: Optional[int] = None,
+        search_mode: Optional[str] = None,
+        similarity_threshold: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """Automatic recall: the entities the terms of a prompt name, with their neighbours.
+
+        Each term is searched on its own and only hits scoring at least :attr:`min_score` are kept.
+        The ``limit`` slots are then dealt round-robin across the terms, emails and multi-word names
+        first, so one noisy term cannot fill the page: in "What do we know about Stephen Grimason?"
+        the five weak semantic hits for "What" no longer push "Steven Grimason" out. At most
+        ``limit`` terms are searched, so every searched term can win a slot and a long prompt does
+        not cost more than ``limit`` round trips.
+        """
+        limit = _int_in_range(limit, 1, SEARCH_MAX_LIMIT, "limit")
+        unique: List[str] = []
+        for term in (str(t).strip() for t in terms if t and str(t).strip()):
+            if term.lower() not in {u.lower() for u in unique}:
+                unique.append(term)
+        ordered = sorted(unique, key=_priority)[:limit]  # sorted() is stable: prompt order within a tier
+        queues = [self._relevant(self.search(term, limit=limit, label=label, depth=depth,
+                                             search_mode=search_mode,
+                                             similarity_threshold=similarity_threshold))
+                  for term in ordered]
+        hits: List[Dict[str, Any]] = []
+        seen: set = set()
+        while len(hits) < limit and any(queues):
+            for queue in queues:
+                while queue:
+                    hit = queue.pop(0)
+                    if hit["id"] not in seen:
+                        seen.add(hit["id"])
+                        hits.append(hit)
+                        break
+                if len(hits) >= limit:
+                    break
         return hits
+
+    def _relevant(self, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Hits scoring at least :attr:`min_score`. A server too old to score its results (no
+        ``_score``) keeps every hit, as recall did before scores, and says so once."""
+        if any(not isinstance(hit.get("score"), (int, float)) for hit in hits):
+            if not self._warned_unscored:
+                self._warned_unscored = True
+                logger.warning("Reverie: the mcp-reverie server returned search results without a score, so "
+                               "recall_min_score is not applied; upgrade it to %s or newer", MIN_SERVER_VERSION)
+            return list(hits)
+        return [hit for hit in hits if hit["score"] >= self.min_score]
 
     @staticmethod
     def _to_hit(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """One search row in the shape the provider renders: ``{id, label, props, rels, score, match}``.
+        """One search row in the shape the provider renders: ``{id, label, props, rels, score, match}``,
+        plus ``matched`` (the stored name or alias) for a fuzzy hit.
 
         ``rels`` keeps the old key names. Direction is not recoverable from the server's
         scrubbed relationship objects (they carry properties, ``_id`` and ``_type`` only), so
@@ -386,10 +482,11 @@ class Graph:
             "rels": rels[:MAX_RELS],
             "score": memory.get("_score"),
             "match": memory.get("_match"),
+            **({"matched": memory["_matched"]} if memory.get("_matched") is not None else {}),
         }
 
     def probe(self, name: str) -> List[Dict[str, Any]]:
-        return self.recall([name.strip()], limit=3)
+        return self.search(name, limit=3)
 
     def find_all(self, name: str, label: Optional[str] = None) -> List[Dict[str, Any]]:
         """Every live node whose ``name`` — or alias, or email — equals ``name``, case-insensitively.
