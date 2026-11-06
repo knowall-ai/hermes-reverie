@@ -115,3 +115,23 @@ def test_live_roundtrip():
         for node_id in created:
             g.call("delete_memory", nodeId=node_id)
         g.close()
+
+
+@pytest.mark.skipif(
+    not (os.environ.get("NEO4J_PASSWORD") and shutil.which("reverie")),
+    reason="needs the mcp-reverie server (0.5.4+) on PATH and a live Neo4j behind it",
+)
+def test_live_misheard_name_is_recalled():
+    """The voice-call regression end to end: "Stephen Grimason" must recall "Steven Grimason"."""
+    g = Graph.from_env()
+    created = []
+    try:
+        created.append(g.remember("Person", "Reverie Steven Grimason", {"role": "Director"})["id"])
+        created.append(g.remember("Concept", "Reverie What We Know", {"notes": "what is known"})["id"])
+        hits = g.recall(["What", "Reverie Stephen Grimason"], limit=5)
+        assert hits and hits[0]["props"]["name"] == "Reverie Steven Grimason"
+        assert hits[0]["match"] == "fuzzy" and hits[0]["score"] >= g.min_score
+    finally:
+        for node_id in created:
+            g.call("delete_memory", nodeId=node_id)
+        g.close()

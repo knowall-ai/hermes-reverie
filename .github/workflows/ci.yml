@@ -26,3 +26,31 @@ jobs:
       # --rootdir=tests: the repo root is itself a Python package (__init__.py), and pytest
       # cannot import it when the checkout folder has a hyphen in its name (hermes-reverie).
       - run: pytest --rootdir=tests tests
+
+  version:
+    # Hermes installs and updates this plugin from git, so every change to what it runs is a
+    # release: a PR that changes the plugin's code or skills must also change plugin.yaml's version.
+    name: Version bumped with the code
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Code changed, so plugin.yaml version must change
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          base="$(git merge-base "$BASE_SHA" HEAD)"
+          changed="$(git diff --name-only "$base" HEAD -- '*.py' 'skills/' ':(exclude)tests/')"
+          if [ -z "$changed" ]; then echo "No plugin code changed; no bump needed"; exit 0; fi
+          version() { python3 -c "import sys, yaml; print(yaml.safe_load(sys.stdin)['version'])"; }
+          old="$(git show "$base:plugin.yaml" | version)"
+          new="$(version < plugin.yaml)"
+          if [ "$old" = "$new" ]; then
+            echo "::error::Plugin code changed but plugin.yaml is still version $old. Bump it. Changed:"
+            echo "$changed"
+            exit 1
+          fi
+          echo "Plugin code changed; version $old -> $new"

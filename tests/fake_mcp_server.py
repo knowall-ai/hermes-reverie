@@ -319,7 +319,8 @@ class FakeServer:
         params = message.get("params") or {}
         if method == "initialize":
             return {"protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "fake-reverie", "version": "0.0.0"}}
+                    "serverInfo": {"name": "fake-reverie",
+                                   "version": os.environ.get("FAKE_MCP_SERVER_VERSION", "0.5.4")}}
         if method == "tools/list":
             return {"tools": [{"name": name, "description": name,
                                "inputSchema": {"type": "object", "properties": {}}} for name in self.TOOLS]}

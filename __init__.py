@@ -29,7 +29,8 @@ from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
 
-from .graph import CANONICAL_LABELS, DEFAULT_SERVER_COMMAND, SEARCH_MODES, Graph
+from .graph import (CANONICAL_LABELS, DEFAULT_RECALL_MIN_SCORE, DEFAULT_SERVER_COMMAND, SEARCH_MODES,
+                    Graph, server_version_warning)
 
 logger = logging.getLogger(__name__)
 
@@ -113,12 +114,19 @@ REVERIE_TOOL = {
         "Reverie: your knowledge graph of people, organisations, projects, products, concepts, "
         "meetings and decisions. Recall happens automatically before each turn; use this tool to "
         "look deeper or to write.\n\nACTIONS:\n"
-        "• search — hybrid keyword + semantic search, so 'Sam Taylor' also finds 'Samantha Taylor'. "
-        "Optional search_mode (hybrid | keyword | semantic | exact) and similarity_threshold (0-1, "
+        "• search — hybrid keyword + semantic + fuzzy name search, so 'Sam Taylor' also finds 'Samantha Taylor'. "
+        "Optional search_mode (hybrid | keyword | semantic | exact | fuzzy) and similarity_threshold (0-1, "
         "default 0.4) tune it: exact to ask whether one name is already in the graph (it matches only a "
-        "memory whose name, alias or email equals the query), keyword for a literal word, semantic for "
+        "memory whose name, alias or email equals the query), fuzzy for a name that may be misspelled or "
+        "misheard ('Stephen Grimason' finds 'Steven Grimason'), keyword for a literal word, semantic for "
         "'who else is like this', a higher threshold for fewer, closer matches. Archived memories are "
-        "never returned.\n"
+        "never returned. Every result has score (0-1) and match (exact | keyword | semantic | fuzzy); a "
+        "fuzzy result also has matched, the stored spelling, which means 'did you mean <matched>?', so "
+        "check it is the same person or thing. A semantic-only score below about 0.5 is usually unrelated.\n"
+        "Automatic recall shows only well-scored matches. When someone or something the user named is not "
+        "in the recalled context, search for it yourself before saying you know nothing: try the surname or "
+        "the most distinctive word on its own, and search_mode fuzzy. Names in voice-call transcripts are "
+        "often misspelled.\n"
         "• probe — everything about one entity and its relationships.\n"
         "• remember — create or update ONE entity: label + name + its own scalar properties (role, email, "
         "aliases, notes). Where someone works is a WORKS_AT edge to an Organization node, not a company property. An existing entity with the same name is updated, never duplicated.\n"
@@ -162,8 +170,9 @@ REVERIE_TOOL = {
             "type": {"type": "string", "description": "connect/forget: relationship type in UPPER_SNAKE"},
             "limit": {"type": "integer", "description": "max results (default 10)", "minimum": 1},
             "search_mode": {"type": "string", "enum": list(SEARCH_MODES),
-                            "description": "search: hybrid (default), keyword-only, semantic-only, or "
-                                           "exact (case-insensitive equality on name, alias or email)"},
+                            "description": "search: hybrid (default), keyword-only, semantic-only, "
+                                           "exact (case-insensitive equality on name, alias or email), or "
+                                           "fuzzy (misspelled or misheard names)"},
             "similarity_threshold": {"type": "number", "minimum": 0, "maximum": 1,
                                      "description": "search: semantic cut-off, 0-1 (server default 0.4)"},
             "depth": {"type": "integer", "minimum": 0, "maximum": 5,
@@ -227,6 +236,7 @@ class ReverieMemoryProvider(MemoryProvider):
             {"key": "search_mode", "description": "Recall mode: hybrid, keyword or semantic", "default": "hybrid"},
             {"key": "similarity_threshold", "description": "Semantic similarity cut-off, 0-1 (blank = the server's 0.4)", "default": ""},
             {"key": "recall_limit", "description": "Entities recalled per turn", "default": "5", "type": "integer", "minimum": 1, "maximum": 20},
+            {"key": "recall_min_score", "description": "Lowest relevance score (0-1) a recalled entity needs", "default": str(DEFAULT_RECALL_MIN_SCORE)},
             {"key": "recall_depth", "description": "Relationship hops recalled with each entity", "default": "1", "type": "integer", "minimum": 0, "maximum": 5},
             {"key": "server_timeout", "description": "Seconds to wait for a tool call", "default": "30"},
             {"key": "server_startup_timeout", "description": "Seconds to wait for the server handshake (the local embedding model downloads on first use)", "default": "60"},
@@ -234,8 +244,8 @@ class ReverieMemoryProvider(MemoryProvider):
         ]
 
     CONFIG_KEYS = ("recall_limit", "dreaming_schedule", "server_command", "embeddings", "search_mode",
-                   "similarity_threshold", "recall_depth", "server_timeout", "server_startup_timeout",
-                   "model_cache")
+                   "similarity_threshold", "recall_depth", "recall_min_score", "server_timeout",
+                   "server_startup_timeout", "model_cache")
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
         keep = {k: v for k, v in values.items() if k in self.CONFIG_KEYS}
@@ -289,6 +299,11 @@ class ReverieMemoryProvider(MemoryProvider):
             if not self._graph.ping():
                 logger.warning("Reverie: the mcp-reverie server (%s) did not answer; is Neo4j up at %s?",
                                self._server_command(), os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687"))
+            else:
+                # Too old a server still works, it just misses misspelled names: warn, never refuse.
+                warning = server_version_warning(self._graph.server_info())
+                if warning:
+                    logger.warning(warning)
         except Exception as exc:
             logger.warning("Reverie: could not start the mcp-reverie server: %s", exc)
             self._graph = None
@@ -313,7 +328,11 @@ class ReverieMemoryProvider(MemoryProvider):
             "Use the reverie tool to probe deeper, and to remember/connect facts worth keeping: who works where, "
             "who decided what, which project is blocked by whom. Remember as soon as you hear a durable fact, "
             "not at the end. One node per person/pet/organisation/project and one edge per relationship — "
-            "never a list of names inside a property. Search before creating. Labels: "
+            "never a list of names inside a property. Search before creating. "
+            "Recall only shows well-scored matches: when someone or something the user named is missing from "
+            "'## Reverie recalls', search for it with the reverie tool (the surname or most distinctive word, "
+            "and search_mode fuzzy) before saying you know nothing; spoken names in call transcripts are often "
+            "misspelled. A fuzzy match is a different spelling of a stored name: check it is the same one. Labels: "
             + ", ".join(CANONICAL_LABELS) + " (Pet is accepted too)."
         )
 
@@ -343,6 +362,8 @@ class ReverieMemoryProvider(MemoryProvider):
         p = hit.get("props") or {}
         bits = [b for b in (p.get("role"), p.get("company"), p.get("email")) if b]
         line = f"- {hit.get('label')} **{p.get('name')}**" + (f" ({', '.join(bits)})" if bits else "")
+        if hit.get("match") == "fuzzy":
+            line += f" [fuzzy name match, score {hit.get('score')}]"
         if p.get("notes"):
             line += f": {str(p['notes'])[:160]}"
         rels = [r for r in (hit.get("rels") or []) if r.get("type")]
@@ -370,8 +391,8 @@ class ReverieMemoryProvider(MemoryProvider):
                 if flag in args:
                     _as_bool(args[flag], f"'{flag}'")
             if action == "search":
-                results = self._graph.recall(
-                    [args.get("query", "")], limit=limit, label=args.get("label"),
+                results = self._graph.search(
+                    args.get("query", ""), limit=limit, label=args.get("label"),
                     depth=args.get("depth"), search_mode=args.get("search_mode"),
                     similarity_threshold=args.get("similarity_threshold"),
                 )

@@ -1,11 +1,18 @@
 name: reverie
-version: 0.2.0
+version: 0.3.0
 description: "Reverie — KnowAll graph memory that dreams. A Neo4j knowledge graph (people, organisations, projects, concepts, meetings) behind the mcp-reverie MCP server, recalled before every turn, plus nightly Dreaming consolidation."
 author: KnowAll AI
-kind: memory
+# No `kind`: Hermes finds memory providers by their register_memory_provider() call and, given no
+# kind, records this one as `exclusive` (selected by memory.provider). `kind: memory` was never a
+# valid kind and logged "unknown kind 'memory' ... treating as 'standalone'" on every load.
 # No pip dependencies: the graph is reached over stdio MCP, not the Neo4j driver.
-# The mcp-reverie server must be on PATH: npm install -g github:knowall-ai/mcp-reverie
+# Needs the mcp-reverie server >= 0.5.4 on PATH (fuzzy name matching; checked against its
+# serverInfo at start-up, with a warning, not a refusal, when it is older).
 pip_dependencies: []
+external_dependencies:
+  - name: reverie
+    install: "npm install -g @knowall-ai/reverie@^0.5.4"
+    check: "which reverie"
 requires_env:
   - NEO4J_PASSWORD
 optional_env:
@@ -26,14 +33,17 @@ config:
     description: "Embeddings for semantic search: local (default), openai, azure, ollama, voyage or none"
     default: local
   search_mode:
-    description: "Recall search mode: hybrid (default), keyword or semantic"
+    description: "Recall search mode: hybrid (default; includes fuzzy name matching), keyword or semantic"
     default: hybrid
   similarity_threshold:
     description: Semantic similarity cut-off, 0-1 (server default 0.4)
     default: ""
   recall_limit:
-    description: Entities recalled per turn
+    description: Entities recalled per turn, shared fairly across the names in the prompt
     default: 5
+  recall_min_score:
+    description: "Lowest relevance score (0-1) a recalled entity needs; 0.5 drops weak semantic matches for common words"
+    default: 0.5
   recall_depth:
     description: Relationship hops included with each recalled entity, 0-5
     default: 1

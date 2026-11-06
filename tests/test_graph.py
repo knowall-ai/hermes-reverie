@@ -35,7 +35,7 @@ def memory(node_id, label, **props):
 
 
 # -- mapping -----------------------------------------------------------------
-def test_recall_maps_to_search_memories_with_one_call():
+def test_recall_maps_each_term_to_one_search_memories_call():
     client = RecordingClient([[{"memory": memory(1, "Person", name="Ava Walsh", role="CEO", _score=1.0,
                                                  _match="keyword"),
                                 "connections": [{"memory": memory(2, "Organization", name="Atlantic Pharma"),
@@ -44,10 +44,10 @@ def test_recall_maps_to_search_memories_with_one_call():
     graph = Graph(client, search_mode="hybrid", similarity_threshold=0.55, depth=2)
     hits = graph.recall(["Ava Walsh", "ava@atlanticpharma.example"], limit=5)
 
-    assert len(client.calls) == 1, "recall must be a single round trip"
+    assert [c[1]["query"] for c in client.calls] == ["Ava Walsh", "ava@atlanticpharma.example"], \
+        "one search per term, so each term gets its own share of the slots"
     tool, args = client.calls[0]
     assert tool == "search_memories"
-    assert args["query"] == "Ava Walsh ava@atlanticpharma.example"
     assert args["search_mode"] == "hybrid" and args["similarity_threshold"] == 0.55
     assert args["depth"] == 2 and args["limit"] == 5  # exactly the limit: the server hides archived nodes
 
@@ -354,7 +354,10 @@ def test_similarity_threshold_must_be_finite_and_in_range(bad):
 
 def test_search_mode_is_validated():
     with pytest.raises(ValueError, match="invalid search_mode"):
-        Graph(RecordingClient([[]])).search_memories("x", search_mode="fuzzy")
+        Graph(RecordingClient([[]])).search_memories("x", search_mode="fuzzzy")
+    client = RecordingClient([[]])
+    Graph(client).search_memories("x", search_mode="fuzzy")  # mcp-reverie 0.5.4+
+    assert client.calls[0][1]["search_mode"] == "fuzzy"
 
 
 def test_search_sends_only_keys_the_server_allows():
